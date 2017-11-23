@@ -14,11 +14,11 @@ namespace swissknife {
 class CommandLetter : public Command {
  public:
   ~CommandLetter() { }
-  std::string GetName() { return "letter"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "letter"; }
+  virtual std::string GetDescription() const {
     return "Signs arbitrary text with the repository certificate.";
   }
-  ParameterList GetParams() {
+  virtual ParameterList GetParams() const {
     ParameterList r;
     r.push_back(Parameter::Switch('s', "sign text"));
     r.push_back(Parameter::Optional('a', "hash algorithm"));
@@ -36,6 +36,9 @@ class CommandLetter : public Command {
     return r;
   }
   int Main(const ArgumentList &args);
+
+ private:
+  static const unsigned kDefaultMaxAge = 300;  // 5 minutes
 };
 
 }  // namespace swissknife

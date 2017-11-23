@@ -4,26 +4,9 @@
 script_location=$(dirname $(readlink --canonicalize $0))
 . ${script_location}/common_setup.sh
 
-# create additional disk partitions to accomodate CVMFS test repos
-echo -n "creating additional disk partitions... "
-disk_to_partition=/dev/vda
-free_disk_space=$(get_unpartitioned_space $disk_to_partition)
-if [ $free_disk_space -lt 25000000000 ]; then # at least 25GB required
-  die "fail (not enough unpartitioned disk space - $free_disk_space bytes)"
-fi
-partition_size=$(( $free_disk_space / 2 - 10240000))
-create_partition $disk_to_partition $partition_size || die "fail (creating partition 1)"
-create_partition $disk_to_partition $partition_size || die "fail (creating partition 2)"
-echo "done"
-
 # update packages installed on the system
-echo "updating installed RPM packages (including kernel)..."
+echo "updating installed RPM packages..."
 sudo dnf -y update || die "fail (dnf update)"
-
-# disable SELinux (OverlayFS doesn't support it)
-echo -n "set SELinux into permissive mode..."
-sudo setenforce 0 || die "fail"
-echo "done"
 
 # install CernVM-FS RPM packages
 echo "installing RPM packages... "
@@ -48,12 +31,33 @@ echo "done"
 
 # install additional stuff (needed for perl testing tools)
 echo "installing additional RPM packages..."
+install_from_repo file
 install_from_repo gcc
 install_from_repo gcc-c++
 install_from_repo rubygems
 install_from_repo java
+install_from_repo nc
+install_from_repo wget
+install_from_repo bc
+
+# traffic shaping
+install_from_repo trickle
+
+# install build dependencies for `libcvmfs`
+install_from_repo openssl-devel
+install_from_repo libuuid-devel
+
+# install stuff necessary to build `cvmfs_preload`
+install_from_repo cmake
+install_from_repo patch
+install_from_repo libattr-devel
 
 # increase open file descriptor limits
 echo -n "increasing ulimit -n ... "
 set_nofile_limit 65536 || die "fail"
 echo "done"
+
+# rebooting the system (returning 0 value)
+echo "sleep 1 && reboot" > killme.sh
+sudo nohup sh < killme.sh &
+exit 0

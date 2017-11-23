@@ -31,6 +31,8 @@ rm -f SnP-interface.h
 ln -s $(cat arch)/SnP-interface.h SnP-interface.h
 
 make clean
-make ARCH=$(cat arch)
+make CVMFS_CASE_C_FLAGS="$CVMFS_BASE_C_FLAGS" ARCH=$(cat arch)
 strip -S libsha3.a
 
+cp -v *.h $EXTERNALS_INSTALL_LOCATION/include/
+cp -v libsha3.a $EXTERNALS_INSTALL_LOCATION/lib/

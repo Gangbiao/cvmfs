@@ -1,0 +1,23 @@
+#!/bin/bash
+# Rsync into cvmfs.
+# This used to be more complicated, and is now here mainly for backward
+#  compatibility and as a guide for people who don't know the right rsync
+#  options to use.
+
+ME=cvmfs_rsync
+
+usage()
+{
+    echo "Usage: $ME [rsync_parameters]" >&2
+    echo "  Rsync to cvmfs repositories.  Avoids .cvmfscatalog and .cvmfsautocatalog" >&2
+    echo "  files while allowing directories containing them to be deleted when their" >&2
+    echo "  source goes away." >&2
+    exit 1
+}
+
+if [ $# -lt 2 ]; then
+    echo "$ME: not enough parameters" >&2
+    usage
+fi
+
+exec rsync --filter='-p .cvmfscatalog' --filter='-p .cvmfsautocatalog' "$@"

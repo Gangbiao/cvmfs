@@ -4,15 +4,18 @@
 
 #include <gtest/gtest.h>
 
-#include "../../cvmfs/platform.h"
+#include "platform.h"
 
-TEST(T_Platforms, OsVersion) {
-  int major = -1;
-  int minor = -1;
-  int patch = -1;
-  platform_get_os_version(&major, &minor, &patch);
+// TODO(Radu): Could add some unit tests for all the functions in
+//             platform_{linux,osx}.h
 
-  EXPECT_GT(major, 0);
-  EXPECT_GE(minor, 0);
-  EXPECT_GE(patch, 0);
+class T_Platform : public ::testing::Test {};
+
+TEST_F(T_Platform, Spinlock) {
+  platform_spinlock lock;
+  platform_spinlock_init(&lock, PTHREAD_PROCESS_PRIVATE);
+  ASSERT_EQ(0, platform_spinlock_trylock(&lock));
+  ASSERT_NE(0, platform_spinlock_trylock(&lock));
+  platform_spinlock_unlock(&lock);
+  ASSERT_EQ(0, platform_spinlock_trylock(&lock));
 }

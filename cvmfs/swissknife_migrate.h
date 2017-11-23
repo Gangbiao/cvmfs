@@ -17,7 +17,7 @@
 #include "hash.h"
 #include "uid_map.h"
 #include "upload.h"
-#include "util.h"
+#include "util/algorithm.h"
 #include "util_concurrency.h"
 
 namespace catalog {
@@ -61,14 +61,15 @@ class CommandMigrate : public Command {
   struct PendingCatalog;
   typedef std::vector<PendingCatalog *> PendingCatalogList;
   struct PendingCatalog {
-    explicit PendingCatalog(const catalog::Catalog *old_catalog = NULL) :
-      success(false),
-      old_catalog(old_catalog),
-      new_catalog(NULL) { }
+    explicit PendingCatalog(const catalog::Catalog *old_catalog = NULL)
+      : success(false)
+      , old_catalog(old_catalog)
+      , new_catalog(NULL)
+      , new_catalog_size(0) { }
     virtual ~PendingCatalog();
 
     inline const std::string root_path() const {
-      return old_catalog->path().ToString();
+      return old_catalog->mountpoint().ToString();
     }
     inline bool IsRoot() const { return old_catalog->IsRoot(); }
     inline bool HasNew() const { return new_catalog != NULL;   }
@@ -129,6 +130,7 @@ class CommandMigrate : public Command {
     bool RunMigration(PendingCatalog *data) const { return false; }
 
     bool UpdateNestedCatalogReferences(PendingCatalog *data) const;
+    bool UpdateCatalogMetadata(PendingCatalog *data) const;
     bool CleanupNestedCatalogs(PendingCatalog *data) const;
     bool CollectAndAggregateStatistics(PendingCatalog *data) const;
 
@@ -273,12 +275,12 @@ class CommandMigrate : public Command {
  public:
   CommandMigrate();
   ~CommandMigrate() { }
-  std::string GetName() { return "migrate"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "migrate"; }
+  virtual std::string GetDescription() const {
     return "CernVM-FS catalog repository migration \n"
       "This command migrates the whole catalog structure of a given repository";
   }
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
 
   int Main(const ArgumentList &args);
 
@@ -289,7 +291,9 @@ class CommandMigrate : public Command {
 
  protected:
   template <class ObjectFetcherT>
-  bool LoadCatalogs(ObjectFetcherT *object_fetcher) {
+  bool LoadCatalogs(const shash::Any &manual_root_hash,
+                    ObjectFetcherT *object_fetcher)
+  {
     typename CatalogTraversal<ObjectFetcherT>::Parameters params;
     const bool generate_full_catalog_tree = true;
     params.no_close       = generate_full_catalog_tree;
@@ -297,7 +301,9 @@ class CommandMigrate : public Command {
     CatalogTraversal<ObjectFetcherT> traversal(params);
     traversal.RegisterListener(&CommandMigrate::CatalogCallback, this);
 
-    return traversal.Traverse();
+    if (manual_root_hash.IsNull())
+      return traversal.Traverse();
+    return traversal.Traverse(manual_root_hash);
   }
 
   void CatalogCallback(

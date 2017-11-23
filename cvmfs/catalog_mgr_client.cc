@@ -5,13 +5,18 @@
 #include "cvmfs_config.h"
 #include "catalog_mgr_client.h"
 
-#include "cache.h"
+#include <string>
+#include <vector>
+
+#include "cache_posix.h"
 #include "download.h"
 #include "fetch.h"
 #include "manifest.h"
 #include "quota.h"
 #include "signature.h"
 #include "statistics.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -41,6 +46,7 @@ ClientCatalogManager::ClientCatalogManager(
   , offline_mode_(false)
   , all_inodes_(0)
   , loaded_inodes_(0)
+  , fixed_alt_root_catalog_(false)
 {
   LogCvmfs(kLogCatalog, kLogDebug, "constructing client catalog manager");
   n_certificate_hits_ = statistics->Register("cache.n_certificate_hits",
@@ -83,10 +89,14 @@ shash::Any ClientCatalogManager::GetRootHash() {
 /**
  * Specialized initialization that uses a fixed root hash.
  */
-bool ClientCatalogManager::InitFixed(const shash::Any &root_hash) {
+bool ClientCatalogManager::InitFixed(
+  const shash::Any &root_hash,
+  bool alternative_path)
+{
   LogCvmfs(kLogCatalog, kLogDebug, "Initialize catalog with root hash %s",
            root_hash.ToString().c_str());
   WriteLock();
+  fixed_alt_root_catalog_ = alternative_path;
   bool attached = MountCatalog(PathString("", 0), root_hash, NULL);
   Unlock();
 
@@ -118,7 +128,11 @@ LoadError ClientCatalogManager::LoadCatalog(
   // Load a particular catalog
   if (!hash.IsNull()) {
     cvmfs_path += " (" + hash.ToString() + ")";
-    LoadError load_error = LoadCatalogCas(hash, cvmfs_path, catalog_path);
+    string alt_catalog_path = "";
+    if (mountpoint.IsEmpty() && fixed_alt_root_catalog_)
+      alt_catalog_path = hash.MakeAlternativePath();
+    LoadError load_error =
+      LoadCatalogCas(hash, cvmfs_path, alt_catalog_path, catalog_path);
     if (load_error == catalog::kLoadNew)
       loaded_catalogs_[mountpoint] = hash;
     *catalog_hash = hash;
@@ -129,9 +143,9 @@ LoadError ClientCatalogManager::LoadCatalog(
   string checksum_dir = ".";
   // TODO(jblomer): find a way to remove this hack
   if (!FileExists("cvmfschecksum." + repo_name_)) {
-    if (fetcher_->cache_mgr()->id() == cache::kPosixCacheManager) {
-      cache::PosixCacheManager *cache_mgr =
-        reinterpret_cast<cache::PosixCacheManager *>(fetcher_->cache_mgr());
+    if (fetcher_->cache_mgr()->id() == kPosixCacheManager) {
+      PosixCacheManager *cache_mgr =
+        reinterpret_cast<PosixCacheManager *>(fetcher_->cache_mgr());
       if (cache_mgr->alien_cache())
         checksum_dir = cache_mgr->cache_path();
     }
@@ -160,7 +174,8 @@ LoadError ClientCatalogManager::LoadCatalog(
              manifest_failure, manifest::Code2Ascii(manifest_failure));
 
     if (catalog_path) {
-      LoadError error = LoadCatalogCas(cache_hash, cvmfs_path, catalog_path);
+      LoadError error =
+        LoadCatalogCas(cache_hash, cvmfs_path, "", catalog_path);
       if (error != catalog::kLoadNew)
         return error;
     }
@@ -178,7 +193,8 @@ LoadError ClientCatalogManager::LoadCatalog(
   // Short way out, use cached copy
   if (ensemble.manifest->catalog_hash() == cache_hash) {
     if (catalog_path) {
-      LoadError error = LoadCatalogCas(cache_hash, cvmfs_path, catalog_path);
+      LoadError error =
+        LoadCatalogCas(cache_hash, cvmfs_path, "", catalog_path);
       if (error == catalog::kLoadNew) {
         loaded_catalogs_[mountpoint] = cache_hash;
         *catalog_hash = cache_hash;
@@ -197,7 +213,11 @@ LoadError ClientCatalogManager::LoadCatalog(
 
   // Load new catalog
   catalog::LoadError load_retval =
-    LoadCatalogCas(ensemble.manifest->catalog_hash(), cvmfs_path, catalog_path);
+    LoadCatalogCas(ensemble.manifest->catalog_hash(),
+                   cvmfs_path,
+                   ensemble.manifest->has_alt_catalog_path() ?
+                     ensemble.manifest->MakeCatalogPath() : "",
+                   catalog_path);
   if (load_retval != catalog::kLoadNew)
     return load_retval;
   loaded_catalogs_[mountpoint] = ensemble.manifest->catalog_hash();
@@ -215,11 +235,12 @@ LoadError ClientCatalogManager::LoadCatalog(
 LoadError ClientCatalogManager::LoadCatalogCas(
   const shash::Any &hash,
   const string &name,
+  const std::string &alt_catalog_path,
   string *catalog_path)
 {
   assert(hash.suffix == shash::kSuffixCatalog);
-  int fd = fetcher_->Fetch(hash, cache::CacheManager::kSizeUnknown, name,
-                           cache::CacheManager::kTypeCatalog);
+  int fd = fetcher_->Fetch(hash, CacheManager::kSizeUnknown, name,
+    zlib::kZlibDefault, CacheManager::kTypeCatalog, alt_catalog_path);
   if (fd >= 0) {
     *catalog_path = "@" + StringifyInt(fd);
     return kLoadNew;
@@ -234,10 +255,10 @@ LoadError ClientCatalogManager::LoadCatalogCas(
 
 void ClientCatalogManager::UnloadCatalog(const Catalog *catalog) {
   LogCvmfs(kLogCache, kLogDebug, "unloading catalog %s",
-           catalog->path().c_str());
+           catalog->mountpoint().c_str());
 
   map<PathString, shash::Any>::iterator iter =
-    mounted_catalogs_.find(catalog->path());
+    mounted_catalogs_.find(catalog->mountpoint());
   assert(iter != mounted_catalogs_.end());
   fetcher_->cache_mgr()->quota_mgr()->Unpin(iter->second);
   mounted_catalogs_.erase(iter);
@@ -246,12 +267,55 @@ void ClientCatalogManager::UnloadCatalog(const Catalog *catalog) {
 }
 
 
+/**
+ * Checks if the current repository revision is blacklisted.  The format
+ * of the blacklist lines is '<REPO N' where REPO is the repository name,
+ * N is the revision number, and the two parts are separated by whitespace.
+ * Any revision of REPO less than N is blacklisted.
+ * Note: no extra characters are allowed after N, not even whitespace.
+ * @return true if it is blacklisted, false otherwise
+ */
+bool ClientCatalogManager::IsRevisionBlacklisted() {
+  uint64_t revision = GetRevision();
+
+  LogCvmfs(kLogCache, kLogDebug, "checking if %s revision %u is blacklisted",
+           repo_name_.c_str(), revision);
+
+  vector<string> blacklist = signature_mgr_->GetBlacklist();
+  for (unsigned i = 0; i < blacklist.size(); ++i) {
+    std::string line = blacklist[i];
+    if (line[0] != '<')
+      continue;
+    unsigned idx = repo_name_.length() + 1;
+    if (line.length() <= idx)
+      continue;
+    if ((line[idx] != ' ') && (line[idx] != '\t'))
+      continue;
+    if (line.substr(1, idx - 1) != repo_name_)
+      continue;
+    ++idx;
+    while ((line[idx] == ' ') || (line[idx] == '\t'))
+      ++idx;
+    if (idx >= line.length())
+      continue;
+    uint64_t rev;
+    if (!String2Uint64Parse(line.substr(idx), &rev))
+      continue;
+    if (revision < rev)
+      return true;
+  }
+
+  return false;
+}
+
+
 //------------------------------------------------------------------------------
 
 
 void CachedManifestEnsemble::FetchCertificate(const shash::Any &hash) {
   uint64_t size;
-  bool retval = cache_mgr_->Open2Mem(hash, &cert_buf, &size);
+  bool retval = cache_mgr_->Open2Mem(
+    hash, "certificate for " + catalog_mgr_->repo_name(), &cert_buf, &size);
   cert_size = size;
   if (retval)
     perf::Inc(catalog_mgr_->n_certificate_hits_);

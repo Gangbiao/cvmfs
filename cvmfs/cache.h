@@ -5,44 +5,24 @@
 #ifndef CVMFS_CACHE_H_
 #define CVMFS_CACHE_H_
 
+#define __STDC_FORMAT_MACROS
+
 #include <stdint.h>
-#include <sys/types.h>
 
-#include <map>
 #include <string>
-#include <vector>
 
-#include "atomic.h"
-#include "backoff.h"
-#include "catalog_mgr.h"
-#include "file_chunk.h"
-#include "gtest/gtest_prod.h"
-#include "manifest_fetch.h"
-#include "shortstring.h"
-#include "signature.h"
-#include "statistics.h"
-#include "util.h"
+#include "hash.h"
+#include "util/pointer.h"
 
-namespace catalog {
-class DirectoryEntry;
-class Catalog;
-}
-
-namespace hash {
-struct Any;
-}
-
-namespace download {
-class DownloadManager;
-}
 
 class QuotaManager;
-
-namespace cache {
 
 enum CacheManagerIds {
   kUnknownCacheManager = 0,
   kPosixCacheManager,
+  kRamCacheManager,
+  kTieredCacheManager,
+  kExternalCacheManager,
 };
 
 enum CacheModes {
@@ -98,22 +78,99 @@ class CacheManager : SingleCopy {
     kTypeVolatile,
   };
 
+  /**
+   * Meta-data of an object that the cache may or may not maintain.  Good cache
+   * implementations should at least distinguish between volatile and regular
+   * objects.
+   */
+  struct ObjectInfo {
+    ObjectInfo() : type(kTypeRegular), description() { }
+    ObjectInfo(ObjectType t, const std::string &d) : type(t), description(d) { }
+
+    ObjectType type;
+    /**
+     * Typically the path that triggered storing the object in the cache
+     */
+    std::string description;
+  };
+
+  /**
+   * A content hash together with a (partial) ObjectInfo meta-data.
+   */
+  struct BlessedObject {
+    explicit BlessedObject(const shash::Any &id) : id(id), info() { }
+    BlessedObject(const shash::Any &id, const ObjectInfo info)
+      : id(id)
+      , info(info) { }
+    BlessedObject(const shash::Any &id, ObjectType type)
+      : id(id)
+      , info(type, "") { }
+    BlessedObject(const shash::Any &id, const std::string &description)
+      : id(id)
+      , info(kTypeRegular, description) { }
+    BlessedObject(
+      const shash::Any &id,
+      ObjectType type,
+      const std::string &description)
+      : id(id)
+      , info(type, description) { }
+
+    shash::Any id;
+    ObjectInfo info;
+  };
+  // Convenience constructors, users can call Open(CacheManager::Bless(my_hash))
+  static inline BlessedObject Bless(const shash::Any &id) {
+    return BlessedObject(id);
+  }
+  static inline BlessedObject Bless(
+    const shash::Any &id,
+    const ObjectInfo &info)
+  {
+    return BlessedObject(id, info);
+  }
+  static inline BlessedObject Bless(const shash::Any &id, ObjectType type) {
+    return BlessedObject(id, type);
+  }
+  static inline BlessedObject Bless(
+    const shash::Any &id,
+    const std::string &description)
+  {
+    return BlessedObject(id, description);
+  }
+  static inline BlessedObject Bless(
+    const shash::Any &id,
+    ObjectType type,
+    const std::string &description)
+  {
+    return BlessedObject(id, type, description);
+  }
+
   virtual CacheManagerIds id() = 0;
+  /**
+   * Return a human readable description of the cache instance.  Used in
+   * cvmfs_talk.
+   */
+  virtual std::string Describe() = 0;
 
   virtual bool AcquireQuotaManager(QuotaManager *quota_mgr) = 0;
 
   virtual ~CacheManager();
-  virtual int Open(const shash::Any &id) = 0;
+  /**
+   * Opening an object might get it from a third-party source, e.g. when the
+   * tiered cache manager issues a copy-up operation.  In this case it is
+   * beneficial to register the object with the accurate meta-data, in the same
+   * way it is done during transactions.
+   */
+  virtual int Open(const BlessedObject &object) = 0;
   virtual int64_t GetSize(int fd) = 0;
   virtual int Close(int fd) = 0;
   virtual int64_t Pread(int fd, void *buf, uint64_t size, uint64_t offset) = 0;
   virtual int Dup(int fd) = 0;
   virtual int Readahead(int fd) = 0;
 
-  virtual uint16_t SizeOfTxn() = 0;
+  virtual uint32_t SizeOfTxn() = 0;
   virtual int StartTxn(const shash::Any &id, uint64_t size, void *txn) = 0;
-  virtual void CtrlTxn(const std::string &description,
-                       const ObjectType type,
+  virtual void CtrlTxn(const ObjectInfo &object_info,
                        const int flags,  // reserved for future use
                        void *txn) = 0;
   virtual int64_t Write(const void *buf, uint64_t sz, void *txn) = 0;
@@ -122,11 +179,14 @@ class CacheManager : SingleCopy {
   virtual int OpenFromTxn(void *txn) = 0;
   virtual int CommitTxn(void *txn) = 0;
 
+  virtual void Spawn() = 0;
+
   int OpenPinned(const shash::Any &id,
                  const std::string &description,
                  bool is_catalog);
   int ChecksumFd(int fd, shash::Any *id);
-  bool Open2Mem(const shash::Any &id, unsigned char **buffer, uint64_t *size);
+  bool Open2Mem(const shash::Any &id, const std::string &description,
+                unsigned char **buffer, uint64_t *size);
   bool CommitFromMem(const shash::Any &id,
                      const unsigned char *buffer,
                      const uint64_t size,
@@ -134,134 +194,44 @@ class CacheManager : SingleCopy {
 
   QuotaManager *quota_mgr() { return quota_mgr_; }
 
+  // Rescue the open file table during reload of the fuse module.  For the
+  // POSIX cache, nothing needs to be done because the table is keep in the
+  // kernel for the process.  Other cache managers need to do it manually.
+  void *SaveState(const int fd_progress);
+  void RestoreState(const int fd_progress, void *state);
+  void FreeState(const int fd_progress, void *state);
+
  protected:
   CacheManager();
+
+  // Unless overwritten, Saving/Restoring states will crash the Fuse module
+  virtual void *DoSaveState() { return NULL; }
+  virtual bool DoRestoreState(void *data) { return false; }
+  virtual bool DoFreeState(void *data) { return false; }
 
   /**
    * Never NULL but defaults to NoopQuotaManager.
    */
   QuotaManager *quota_mgr_;
-};
-
-
-/**
- * Cache manger implementation using a file system (cache directory) as a
- * backing storage.
- */
-class PosixCacheManager : public CacheManager {
-  FRIEND_TEST(T_CacheManager, CommitTxnQuotaNotifications);
-  FRIEND_TEST(T_CacheManager, CommitTxnRenameFail);
-  FRIEND_TEST(T_CacheManager, Open);
-  FRIEND_TEST(T_CacheManager, OpenFromTxn);
-  FRIEND_TEST(T_CacheManager, OpenPinned);
-  FRIEND_TEST(T_CacheManager, Rename);
-  FRIEND_TEST(T_CacheManager, StartTxn);
-  FRIEND_TEST(T_CacheManager, TearDown2ReadOnly);
-
- public:
-  enum CacheModes {
-    kCacheReadWrite = 0,
-    kCacheReadOnly,
-  };
-
-  /**
-   * As of 25M, a file is considered a "big file", which means it is dangerous
-   * to apply asynchronous semantics.  On start of a transaction with a big file
-   * the cache is cleaned up opportunistically.
-   */
-  static const uint64_t kBigFile;
-
-  virtual CacheManagerIds id() { return kPosixCacheManager; }
-
-  static PosixCacheManager *Create(const std::string &cache_path,
-                                   const bool alien_cache,
-                                   const bool workaround_rename_ = false);
-  virtual ~PosixCacheManager() { }
-  virtual bool AcquireQuotaManager(QuotaManager *quota_mgr);
-
-  virtual int Open(const shash::Any &id);
-  virtual int64_t GetSize(int fd);
-  virtual int Close(int fd);
-  virtual int64_t Pread(int fd, void *buf, uint64_t size, uint64_t offset);
-  virtual int Dup(int fd);
-  virtual int Readahead(int fd);
-
-  virtual uint16_t SizeOfTxn() { return sizeof(Transaction); }
-  virtual int StartTxn(const shash::Any &id, uint64_t size, void *txn);
-  virtual void CtrlTxn(const std::string &description,
-                       const ObjectType type,
-                       const int flags,
-                       void *txn);
-  virtual int64_t Write(const void *buf, uint64_t size, void *txn);
-  virtual int Reset(void *txn);
-  virtual int OpenFromTxn(void *txn);
-  virtual int AbortTxn(void *txn);
-  virtual int CommitTxn(void *txn);
-
-  void TearDown2ReadOnly();
-  CacheModes cache_mode() { return cache_mode_; }
-  bool alien_cache() { return alien_cache_; }
-  std::string cache_path() { return cache_path_; }
 
  private:
-  struct Transaction {
-    Transaction(const shash::Any &id, const std::string &final_path)
-      : buf_pos(0)
-      , size(0)
-      , expected_size(kSizeUnknown)
-      , fd(-1)
-      , type(kTypeRegular)
-      , tmp_path()
-      , final_path(final_path)
-      , id(id)
+  static const unsigned kStateVersion = 0;
+
+  /**
+   * Wraps around the concrete cache manager's state block in memory.  The
+   * state pointer is used in DoSaveState, DoRestoreState, DoFreeState.
+   */
+  struct State : SingleCopy {
+    State()
+      : version(kStateVersion)
+      , manager_type(kUnknownCacheManager)
+      , concrete_state(NULL)
     { }
 
-    unsigned char buffer[4096];
-    unsigned buf_pos;
-    uint64_t size;
-    uint64_t expected_size;
-    int fd;
-    ObjectType type;
-    std::string tmp_path;
-    std::string final_path;
-    std::string description;
-    shash::Any id;
+    unsigned version;
+    CacheManagerIds manager_type;
+    void *concrete_state;
   };
-
-  PosixCacheManager(const std::string &cache_path, const bool alien_cache)
-    : cache_path_(cache_path)
-    , txn_template_path_(cache_path_ + "/txn/fetchXXXXXX")
-    , alien_cache_(alien_cache)
-    , workaround_rename_(false)
-    , cache_mode_(kCacheReadWrite)
-    , reports_correct_filesize_(true)
-  {
-    atomic_init32(&no_inflight_txns_);
-  }
-
-  std::string GetPathInCache(const shash::Any &id);
-  int Rename(const char *oldpath, const char *newpath);
-  int Flush(Transaction *transaction);
-
-  std::string cache_path_;
-  std::string txn_template_path_;
-  bool alien_cache_;
-  bool workaround_rename_;
-  CacheModes cache_mode_;
-
-  /**
-   * The cache can only degrade to a read-only cache once all writable file
-   * descriptors from transactions are closed.  This is indicated by a zero
-   * value in this variable.
-   */
-  atomic_int32 no_inflight_txns_;
-
-  /**
-   * Hack for HDFS which writes file sizes asynchronously.
-   */
-  bool reports_correct_filesize_;
-};  // class PosixCacheManager
-
-}  // namespace cache
+};  // class CacheManager
 
 #endif  // CVMFS_CACHE_H_

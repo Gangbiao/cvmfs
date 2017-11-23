@@ -1,14 +1,16 @@
 #!/bin/sh
 
-cdir=$(pwd)
-cares_location="../build_c-ares"
-cd $cares_location
-sh makeHook.sh
-cd $cdir
+curl_ssl_config="--with-ssl"
+if [ x"$(uname)" = x"Darwin" ]; then
+    curl_ssl_config="--with-ssl=$EXTERNALS_INSTALL_LOCATION"
+fi
 
-sh configure CPPFLAGS="$CPPFLAGS -I${PWD}/${cares_location} -D_FILE_OFFSET_BITS=64" LDFLAGS="$LDFLAGS -L${PWD}/${cares_location}/.libs -rdynamic" CFLAGS="$CFLAGS -fno-strict-aliasing -fasynchronous-unwind-tables -fno-omit-frame-pointer -fno-optimize-sibling-calls -fvisibility=hidden -fPIC" \
+sh configure CPPFLAGS="$CPPFLAGS -D_FILE_OFFSET_BITS=64" \
+  LDFLAGS="$LDFLAGS -rdynamic" \
+  CFLAGS="$CFLAGS $CVMFS_BASE_C_FLAGS -fvisibility=hidden -fPIC" \
   $CVMFS_ZLIB --enable-warnings \
-  --enable-ares \
+  --prefix=$EXTERNALS_INSTALL_LOCATION \
+  --enable-ares=$EXTERNALS_INSTALL_LOCATION \
   --disable-shared \
   --enable-static \
   --disable-ftp \
@@ -23,31 +25,36 @@ sh configure CPPFLAGS="$CPPFLAGS -I${PWD}/${cares_location} -D_FILE_OFFSET_BITS=
   --disable-tftp \
   --disable-pop3 \
   --disable-imap \
+  --disable-smb \
   --disable-smtp \
   --disable-gopher \
   --disable-threaded-resolver \
   --disable-manual \
   --enable-ipv6 \
+  --disable-verbose \
   --disable-sspi \
   --disable-crypto-auth \
   --disable-cookies \
   --enable-symbol-hiding \
   --disable-tls-srp \
   --disable-ntlm-wb \
-  --without-ssl \
+  --disable-unix-sockets \
+  ${curl_ssl_config} \
   --without-winssl \
   --without-darwinssl \
   --without-gnutls \
   --without-polarssl \
+  --without-mbedtls \
   --without-cyassl \
   --without-axtls \
   --without-nss \
   --without-ca-bundle \
   --without-ca-path \
+  --without-libpsl \
   --without-libssh2 \
   --without-libmetalink \
-  --without-libidn \
+  --without-libidn2 \
   --without-winidn \
   --without-librtmp \
   --without-nghttp2 \
-  --disable-verbose
+  --without-zsh-functions-dir

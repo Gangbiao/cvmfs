@@ -11,13 +11,13 @@
 #include <string>
 #include <vector>
 
-#include "../../cvmfs/cache.h"
-#include "../../cvmfs/compression.h"
-#include "../../cvmfs/fs_traversal.h"
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/quota.h"
-#include "../../cvmfs/util.h"
+#include "cache_posix.h"
+#include "compression.h"
+#include "fs_traversal.h"
+#include "hash.h"
+#include "quota_posix.h"
 #include "testutil.h"
+#include "util/algorithm.h"
 
 using namespace std;  // NOLINT
 
@@ -42,8 +42,8 @@ class T_QuotaManager : public ::testing::Test {
     // Prepare cache directories
     tmp_path_ = CreateTempDir("./cvmfs_ut_quota_manager");
     MkdirDeep(tmp_path_ + "/not_spawned", 0700);
-    delete cache::PosixCacheManager::Create(tmp_path_, false);
-    delete cache::PosixCacheManager::Create(tmp_path_ + "/not_spawned", false);
+    delete PosixCacheManager::Create(tmp_path_, false);
+    delete PosixCacheManager::Create(tmp_path_ + "/not_spawned", false);
 
     limit_ = 10*1024*1024;  // 10M
     threshold_ = 5*1024*1024;  // 5M
@@ -179,11 +179,15 @@ TEST_F(T_QuotaManager, Cleanup) {
 
   quota_mgr_->Insert(hash_null, 1, "");
   quota_mgr_->Insert(hash_rnd, 1, "");
+  EXPECT_EQ(0U, quota_mgr_->GetCleanupRate(60));
   EXPECT_TRUE(quota_mgr_->Cleanup(3));
+  EXPECT_EQ(0U, quota_mgr_->GetCleanupRate(60));
   EXPECT_EQ(2U, quota_mgr_->GetSize());
   EXPECT_TRUE(quota_mgr_->Cleanup(2));
+  EXPECT_EQ(0U, quota_mgr_->GetCleanupRate(60));
   EXPECT_EQ(2U, quota_mgr_->GetSize());
   EXPECT_TRUE(quota_mgr_->Cleanup(0));
+  EXPECT_EQ(1U, quota_mgr_->GetCleanupRate(60));
   EXPECT_EQ(0U, quota_mgr_->GetSize());
   EXPECT_FALSE(FileExists(tmp_path_ + "/" + hash_null.MakePath()));
   EXPECT_FALSE(FileExists(tmp_path_ + "/" + hash_rnd.MakePath()));
@@ -275,6 +279,37 @@ TEST_F(T_QuotaManager, CloseDatabase) {
 }
 
 
+TEST_F(T_QuotaManager, Workspace) {
+  // Test if separation of workspace and cache directory works
+  string workspace = "./cvmfs_ut_quota_workspace";
+  string cache_workspace = tmp_path_ + ":" + workspace;
+  ASSERT_TRUE(MkdirDeep(workspace, 0700));
+  vector<string> dir_entries = FindFiles(workspace, "");
+  // Only ., ..
+  EXPECT_EQ(2U, dir_entries.size());
+  delete quota_mgr_;
+  quota_mgr_ =
+    PosixQuotaManager::Create(cache_workspace, limit_, threshold_, false);
+  quota_mgr_->Spawn();
+  EXPECT_GE(dir_entries.size(), 2U);
+
+  shash::Any hash_null(shash::kSha1);
+  shash::Any hash_rnd(shash::kSha1);
+  hash_rnd.Randomize();
+  quota_mgr_->Insert(hash_null, 1, "/a");
+  EXPECT_TRUE(quota_mgr_->Pin(hash_rnd, 1, "/b", false));
+
+  delete quota_mgr_;
+  quota_mgr_ =
+    PosixQuotaManager::Create(cache_workspace, limit_, threshold_, false);
+  ASSERT_TRUE(quota_mgr_ != NULL);
+  quota_mgr_->Spawn();
+  vector<string> content = quota_mgr_->List();
+  sort(content.begin(), content.end());
+  EXPECT_EQ("/a\n/b\n", PrintStringVector(content));
+}
+
+
 TEST_F(T_QuotaManager, Contains) {
   shash::Any hash_null(shash::kSha1);
   shash::Any hash_rnd(shash::kSha1);
@@ -303,10 +338,10 @@ TEST_F(T_QuotaManager, Create) {
 TEST_F(T_QuotaManager, CreateShared) {
   delete quota_mgr_;
   EXPECT_EQ(NULL,
-    PosixQuotaManager::CreateShared("", tmp_path_ + "/noent", 5, 5));
+    PosixQuotaManager::CreateShared("", tmp_path_ + "/noent", 5, 5, false));
 
   // Forking fails
-  EXPECT_EQ(NULL, PosixQuotaManager::CreateShared("", tmp_path_, 5, 5));
+  EXPECT_EQ(NULL, PosixQuotaManager::CreateShared("", tmp_path_, 5, 5, false));
   EXPECT_EQ(0, unlink((tmp_path_ + "/cachemgr").c_str()));
 
   // TODO(jblomer): test fork logic (requires changes to __cachemgr__ execve)
@@ -472,8 +507,9 @@ TEST_F(T_QuotaManager, RebuildDatabase) {
     PosixQuotaManager::Create(tmp_path_, limit_, threshold_, true);
   ASSERT_TRUE(quota_mgr_ != NULL);
   quota_mgr_->Spawn();
+  // The empty file was removed during rebuild
   EXPECT_EQ(1U, quota_mgr_->GetSize());
-  EXPECT_EQ("unknown (automatic rebuild)\nunknown (automatic rebuild)\n",
+  EXPECT_EQ("unknown (automatic rebuild)\n",
             PrintStringVector(quota_mgr_->List()));
 }
 

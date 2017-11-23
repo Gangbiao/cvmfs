@@ -20,7 +20,8 @@
 
 #include "logging.h"
 #include "sanitizer.h"
-#include "util.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -54,34 +55,67 @@ static string EscapeShell(const std::string &raw) {
 }
 
 
-void SimpleOptionsParser::ParsePath(const string &config_file,
-                                 const bool external __attribute__((unused))) {
+string OptionsManager::TrimParameter(const string &parameter) {
+  string result = Trim(parameter);
+  // Strip "readonly"
+  if (result.find("readonly ") == 0) {
+    result = result.substr(9);
+    result = Trim(result);
+  } else if (result.find("export ") == 0) {
+    result = result.substr(7);
+    result = Trim(result);
+  } else if (result.find("eval ") == 0) {
+    result = result.substr(5);
+    result = Trim(result);
+  }
+  return result;
+}
+
+
+bool SimpleOptionsParser::TryParsePath(const string &config_file) {
   LogCvmfs(kLogCvmfs, kLogDebug, "Fast-parsing config file %s",
       config_file.c_str());
-  int retval;
   string line;
   FILE *fconfig = fopen(config_file.c_str(), "r");
   if (fconfig == NULL)
-    return;
+    return false;
 
   // Read line by line and extract parameters
   while (GetLineFile(fconfig, &line)) {
+    size_t comment_idx = line.find("#");
+    if (comment_idx != string::npos)
+      line = line.substr(0, comment_idx);
     line = Trim(line);
-    if (line.empty() || line[0] == '#' || line.find(" ") < string::npos)
+    if (line.empty())
       continue;
     vector<string> tokens = SplitString(line, '=');
-    if (tokens.size() < 2 || tokens.size() > 2)
+    if (tokens.size() < 2)
+      continue;
+    string parameter = TrimParameter(tokens[0]);
+    if (parameter.find(" ") != string::npos)
+      continue;
+    if (parameter.empty())
       continue;
 
-    ConfigValue value;
-    value.source = config_file;
-    value.value = tokens[1];
-    string parameter = tokens[0];
-    config_[parameter] = value;
-    retval = setenv(parameter.c_str(), value.value.c_str(), 1);
-    assert(retval == 0);
+    // Strip quotes from value
+    tokens.erase(tokens.begin());
+    string value = Trim(JoinStrings(tokens, "="));
+    unsigned value_length = value.length();
+    if (value_length > 2) {
+      if ( ((value[0] == '"') && ((value[value_length - 1] == '"'))) ||
+           ((value[0] == '\'') && ((value[value_length - 1] == '\''))) )
+      {
+        value = value.substr(1, value_length - 2);
+      }
+    }
+
+    ConfigValue config_value;
+    config_value.source = config_file;
+    config_value.value = value;
+    PopulateParameter(parameter, config_value);
   }
   fclose(fconfig);
+  return true;
 }
 
 
@@ -114,8 +148,8 @@ void BashOptionsManager::ParsePath(const string &config_file,
         (void)open(config_file.c_str(), O_RDONLY);
         char ready = 'R';
         WritePipe(pipe_open[1], &ready, 1);
-        read(pipe_quit[0], &ready, 1);
-        _exit(0);  // Don't flush shared file descriptors
+        retval = read(pipe_quit[0], &ready, 1);
+        _exit(retval);  // Don't flush shared file descriptors
       }
     }
     // Parent
@@ -137,8 +171,17 @@ void BashOptionsManager::ParsePath(const string &config_file,
   }
   if (!fconfig) {
     if (external && !DirectoryExists(config_path)) {
+      string repo_required;
+      if (GetValue("CVMFS_CONFIG_REPO_REQUIRED", &repo_required) &&
+        IsOn(repo_required)) {
+          LogCvmfs(kLogCvmfs, kLogStderr | kLogSyslogErr,
+               "required configuration repository directory does not exist: %s",
+               config_path.c_str());
+          abort();
+      }
+
       LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogWarn,
-               "external location for configuration files does not exist: %s",
+               "configuration repository directory does not exist: %s",
                config_path.c_str());
     }
     return;
@@ -173,29 +216,14 @@ void BashOptionsManager::ParsePath(const string &config_file,
 
     ConfigValue value;
     value.source = config_file;
-    string parameter = tokens[0];
-    // Strip "readonly"
-    if (parameter.find("readonly") == 0) {
-      parameter = parameter.substr(8);
-      parameter = Trim(parameter);
-    }
-    // Strip export
-    if (parameter.find("export") == 0) {
-      parameter = parameter.substr(6);
-      parameter = Trim(parameter);
-    }
-    // Strip eval
-    if (parameter.find("eval") == 0) {
-      parameter = parameter.substr(4);
-      parameter = Trim(parameter);
-    }
+    string parameter = TrimParameter(tokens[0]);
+    if (parameter.empty())
+      continue;
 
     const string sh_echo = "echo $" + parameter + "\n";
     WritePipe(fd_stdin, sh_echo.data(), sh_echo.length());
     GetLineFd(fd_stdout, &value.value);
-    config_[parameter] = value;
-    retval = setenv(parameter.c_str(), value.value.c_str(), 1);
-    assert(retval == 0);
+    PopulateParameter(parameter, value);
   }
 
   close(fd_stderr);
@@ -215,7 +243,7 @@ bool OptionsManager::HasConfigRepository(const string &fqrn,
 
   string config_repository;
   if (GetValue("CVMFS_CONFIG_REPOSITORY", &config_repository)) {
-    if (config_repository == fqrn)
+    if (config_repository.empty() || (config_repository == fqrn))
       return false;
     sanitizer::RepositorySanitizer repository_sanitizer;
     if (!repository_sanitizer.IsValid(config_repository)) {
@@ -232,14 +260,22 @@ bool OptionsManager::HasConfigRepository(const string &fqrn,
 
 
 void OptionsManager::ParseDefault(const string &fqrn) {
-  int retval = setenv("CVMFS_FQRN", fqrn.c_str(), 1);
-  assert(retval == 0);
+  if (taint_environment_) {
+    int retval = setenv("CVMFS_FQRN", fqrn.c_str(), 1);
+    assert(retval == 0);
+  }
+
+  protected_parameters_.clear();
 
   ParsePath("/etc/cvmfs/default.conf", false);
   vector<string> dist_defaults = FindFiles("/etc/cvmfs/default.d", ".conf");
   for (unsigned i = 0; i < dist_defaults.size(); ++i) {
     ParsePath(dist_defaults[i], false);
   }
+  ProtectParameter("CVMFS_CONFIG_REPOSITORY");
+  string external_config_path;
+  if ((fqrn != "") && HasConfigRepository(fqrn, &external_config_path))
+    ParsePath(external_config_path + "default.conf", true);
   ParsePath("/etc/cvmfs/default.local", false);
 
   if (fqrn != "") {
@@ -249,7 +285,6 @@ void OptionsManager::ParseDefault(const string &fqrn) {
     tokens.erase(tokens.begin());
     domain = JoinStrings(tokens, ".");
 
-    string external_config_path;
     if (HasConfigRepository(fqrn, &external_config_path))
       ParsePath(external_config_path + "domain.d/" + domain + ".conf", true);
     ParsePath("/etc/cvmfs/domain.d/" + domain + ".conf", false);
@@ -260,6 +295,36 @@ void OptionsManager::ParseDefault(const string &fqrn) {
     ParsePath("/etc/cvmfs/config.d/" + fqrn + ".conf", false);
     ParsePath("/etc/cvmfs/config.d/" + fqrn + ".local", false);
   }
+}
+
+
+void OptionsManager::PopulateParameter(
+  const string &param,
+  const ConfigValue val)
+{
+  map<string, string>::const_iterator iter = protected_parameters_.find(param);
+  if ((iter != protected_parameters_.end()) && (iter->second != val.value)) {
+    LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogErr,
+             "error in cvmfs configuration: attempt to change protected %s "
+             "from %s to %s",
+             param.c_str(), iter->second.c_str(), val.value.c_str());
+    return;
+  }
+
+  config_[param] = val;
+  if (taint_environment_) {
+    int retval = setenv(param.c_str(), val.value.c_str(), 1);
+    assert(retval == 0);
+  }
+}
+
+
+void OptionsManager::ProtectParameter(const string &param) {
+  string value;
+  // We don't care about the result.  If param does not yet exists, we lock it
+  // to the empty string.
+  (void) GetValue(param, &value);
+  protected_parameters_[param] = value;
 }
 
 
@@ -298,7 +363,8 @@ bool OptionsManager::GetSource(const string &key, string *value) {
 
 bool OptionsManager::IsOn(const std::string &param_value) {
   const string uppercase = ToUpper(param_value);
-  return ((uppercase == "YES") || (uppercase == "ON") || (uppercase == "1"));
+  return ((uppercase == "YES") || (uppercase == "ON") || (uppercase == "1") ||
+          (uppercase == "TRUE"));
 }
 
 
@@ -308,6 +374,26 @@ vector<string> OptionsManager::GetAllKeys() {
        iEnd = config_.end(); i != iEnd; ++i)
   {
     result.push_back(i->first);
+  }
+  return result;
+}
+
+
+vector<string> OptionsManager::GetEnvironmentSubset(
+  const string &key_prefix,
+  bool strip_prefix)
+{
+  vector<string> result;
+  for (map<string, ConfigValue>::const_iterator i = config_.begin(),
+       iEnd = config_.end(); i != iEnd; ++i)
+  {
+    const bool ignore_prefix = false;
+    if (HasPrefix(i->first, key_prefix, ignore_prefix)) {
+      const string output_key = strip_prefix
+        ? i->first.substr(key_prefix.length())
+        : i->first;
+      result.push_back(output_key + "=" + i->second.value);
+    }
   }
   return result;
 }
@@ -329,6 +415,22 @@ string OptionsManager::Dump() {
               "    # from " + source + "\n";
   }
   return result;
+}
+
+
+void OptionsManager::SetValue(const string &key, const string &value) {
+  ConfigValue config_value;
+  config_value.source = "@INTERNAL@";
+  config_value.value = value;
+  PopulateParameter(key, config_value);
+}
+
+
+void OptionsManager::UnsetValue(const string &key) {
+  protected_parameters_.erase(key);
+  config_.erase(key);
+  if (taint_environment_)
+    unsetenv(key.c_str());
 }
 
 #ifdef CVMFS_NAMESPACE_GUARD

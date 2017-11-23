@@ -7,9 +7,12 @@
 #include <cerrno>
 #include <gtest/gtest.h>
 
-#include "../../cvmfs/platform.h"
-#include "../../cvmfs/util.h"
-#include "../../cvmfs/xattr.h"
+#include "platform.h"
+#include "util/file_guard.h"
+#include "util/pointer.h"
+#include "util/posix.h"
+#include "util/string.h"
+#include "xattr.h"
 
 using namespace std;  // NOLINT
 
@@ -274,7 +277,7 @@ TEST_F(T_Xattr, Limits) {
   XattrList large_list;
   string large_value(256, 'a');
   for (unsigned i = 0; i < 256; ++i) {
-    char hex[3];
+    char hex[4];
     snprintf(hex, sizeof(hex), "%02x", i);
     string large_key(128, hex[0]);
     large_key += string(128, hex[1]);
@@ -283,7 +286,7 @@ TEST_F(T_Xattr, Limits) {
   EXPECT_EQ(256U, large_list.ListKeys().size());
   for (unsigned i = 0; i < 256; ++i) {
     string value;
-    char hex[3];
+    char hex[4];
     snprintf(hex, sizeof(hex), "%02x", i);
     string large_key(128, hex[0]);
     large_key += string(128, hex[1]);

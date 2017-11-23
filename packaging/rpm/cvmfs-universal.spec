@@ -1,8 +1,15 @@
 
 %{?suse_version:%define dist .suse%suse_version}
+%if 0%{?suse_version} == 1315
+%define sle12 1
+%define dist .sle12
+%endif
 %if 0%{?el6} || 0%{?el7} || 0%{?fedora}
 %define selinux_cvmfs 1
 %define selinux_variants mls strict targeted
+%endif
+%if 0%{?el7} || 0%{?fedora}
+%define selinux_cvmfs_server 1
 %endif
 %if 0%{?dist:1}
 %else
@@ -13,6 +20,11 @@
   %endif
 %endif
 
+# List of platforms that require systemd/autofs fix as described in CVM-1200
+%if 0%{?el7} || 0%{?fedora} || 0%{?sle12}
+%define systemd_autofs_patch 1
+%endif
+
 %define __strip /bin/true
 %define debug_package %{nil}
 %if 0%{?el6} || 0%{?el5} || 0%{?el4}
@@ -21,7 +33,7 @@
 
 Summary: CernVM File System
 Name: cvmfs
-Version: 2.2.0
+Version: 2.5.0
 Release: 1%{?dist}
 Source0: https://ecsft.cern.ch/dist/cvmfs/%{name}-%{version}.tar.gz
 %if 0%{?selinux_cvmfs}
@@ -46,6 +58,7 @@ BuildRequires: gcc4-c++
 %else
 BuildRequires: gcc
 BuildRequires: gcc-c++
+BuildRequires: valgrind-devel
 %endif
 BuildRequires: cmake
 BuildRequires: fuse-devel
@@ -62,7 +75,6 @@ Requires: grep
 Requires: gawk
 Requires: sed
 Requires: perl
-Requires: sudo
 Requires: psmisc
 Requires: autofs
 Requires: fuse
@@ -91,7 +103,7 @@ Requires: shadow-utils
 Requires: SysVinit
 Requires: e2fsprogs
   %else
-    %if 0%{?fc21} || 0%{?fc22}
+    %if 0%{?fedora}
 Requires: procps-ng
     %else
 Requires: sysvinit-tools
@@ -102,6 +114,10 @@ Requires: util-linux-ng
 Requires: util-linux
     %endif
   %endif
+%endif
+%if 0%{?fedora}
+# For cvmfs_talk, does not necessarily come with Fedora >= 25
+Requires: perl-Getopt-Long
 %endif
 Requires: cvmfs-config
 
@@ -145,7 +161,6 @@ Requires: bash
 Requires: coreutils
 Requires: grep
 Requires: sed
-Requires: sudo
 Requires: psmisc
 Requires: curl
 Requires: gzip
@@ -154,6 +169,15 @@ Requires: openssl
 Requires: httpd
 Requires: libcap
 Requires: lsof
+Requires: rsync
+Requires: usbutils
+%if 0%{?el6} || 0%{?el7} || 0%{?fedora} || 0%{?suse_version} >= 1300
+Requires: jq
+%endif
+%if 0%{?selinux_cvmfs_server}
+Requires(post): /usr/sbin/semanage
+Requires(postun): /usr/sbin/semanage
+%endif
 
 Conflicts: cvmfs-server < 2.1
 
@@ -163,7 +187,6 @@ CernVM-FS tools to maintain Stratum 0/1 repositories
 %package unittests
 Summary: CernVM-FS unit tests binary
 Group: Application/System
-Requires: cvmfs-server = %{version}
 %description unittests
 CernVM-FS unit tests binary.  This RPM is not required except for testing.
 
@@ -180,6 +203,10 @@ cp %{SOURCE1} %{SOURCE2} SELinux
 %ifarch i386 i686
 export CXXFLAGS="`echo %{optflags}|sed 's/march=i386/march=i686/'`"
 export CFLAGS="`echo %{optflags}|sed 's/march=i386/march=i686/'`"
+%if 0%{?el5}
+export CFLAGS="$CFLAGS -O0"
+export CXXFLAGS="$CXXFLAGS -O0"
+%endif
 %endif
 
 %if 0%{?el4}
@@ -190,9 +217,9 @@ export CXXFLAGS="$CXXFLAGS -O0"
 %endif
 
 %if 0%{?suse_version}
-cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_UNITTESTS=yes -DINSTALL_UNITTESTS=yes -DCMAKE_INSTALL_PREFIX:PATH=/usr .
+cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_LIBCVMFS_CACHE=yes -DBUILD_UNITTESTS=yes -DINSTALL_UNITTESTS=yes -DCMAKE_INSTALL_PREFIX:PATH=/usr .
 %else
-%cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_UNITTESTS=yes -DINSTALL_UNITTESTS=yes .
+%cmake -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} -DBUILD_SERVER=yes -DBUILD_SERVER_DEBUG=yes -DBUILD_LIBCVMFS=yes -DBUILD_LIBCVMFS_CACHE=yes -DBUILD_UNITTESTS=yes -DINSTALL_UNITTESTS=yes .
 %endif
 
 make %{?_smp_mflags}
@@ -206,6 +233,27 @@ do
     make NAME=${variant} -f %{_datadir}/selinux/devel/Makefile clean
 done
 popd
+%endif
+
+%if 0%{?el4}
+%else
+%pretrans server
+[ -d "/var/spool/cvmfs"  ]          || exit 0
+[ -d "/etc/cvmfs/repositories.d/" ] || exit 0
+
+for repo in /var/spool/cvmfs/*; do
+  [ -d $repo ] && [ ! -f /etc/cvmfs/repositories.d/$(basename $repo)/replica.conf ] || continue
+
+  if [ -f ${repo}/in_transaction.lock ] || \
+     [ -d ${repo}/in_transaction      ] || \
+     [ -f ${repo}/in_transaction      ]; then
+    echo "     Found open CernVM-FS repository transactions."           >&2
+    echo "     Please abort or publish them before updating CernVM-FS." >&2
+    exit 1
+  fi
+done
+
+exit 0
 %endif
 
 %pre
@@ -279,6 +327,16 @@ popd
 /usr/sbin/hardlink -cv $RPM_BUILD_ROOT%{_datadir}/selinux
 %endif
 
+%if 0%{?systemd_autofs_patch}
+mkdir -p $RPM_BUILD_ROOT/usr/lib/systemd/system/autofs.service.d
+cat << EOF > $RPM_BUILD_ROOT/usr/lib/systemd/system/autofs.service.d/50-cvmfs.conf
+# Addresses distribution bug in autofs configuration
+# See CVM-1200 under https://sft.its.cern.ch/jira/browse/CVM-1200
+[Service]
+KillMode=process
+EOF
+%endif
+
 %clean
 rm -rf $RPM_BUILD_ROOT
 
@@ -293,27 +351,39 @@ done
 restorecon -R /var/lib/cvmfs
 %endif
 /sbin/ldconfig
+%if 0%{?systemd_autofs_patch}
+/usr/bin/systemctl daemon-reload
+%endif
 if [ -d /var/run/cvmfs ]; then
   /usr/bin/cvmfs_config reload
 fi
 :
 
-%preun
-%if 0%{?selinux_cvmfs}
-if [ $1 = 0 ] ; then
-    for variant in %{selinux_variants} ; do
-        /usr/sbin/semodule -s ${variant} -r cvmfs &> /dev/null || :
-    done
-fi
+%post server
+/usr/bin/cvmfs_server fix-permissions || :
+%if 0%{?selinux_cvmfs_server}
+# Port 8000 is also assigned to soundd (CVM-1308)
+/usr/sbin/semanage port -m -t http_port_t -p tcp 8000 2>/dev/null || :
 %endif
+
+%preun
+if [ $1 = 0 ] ; then
+%if 0%{?selinux_cvmfs}
+  for variant in %{selinux_variants} ; do
+    /usr/sbin/semodule -s ${variant} -r cvmfs &> /dev/null || :
+  done
+%endif
+
+  /usr/bin/cvmfs_config umount
+fi
 
 %postun
 if [ $1 -eq 0 ]; then
-   #sed -i "/^\/mnt\/cvmfs \/etc\/auto.cvmfs/d" /etc/auto.master
    [ -f /var/lock/subsys/autofs ] && /sbin/service autofs reload >/dev/null
    if [ -e /etc/fuse.conf ]; then
      sed -i "/added by CernVM-FS/d" /etc/fuse.conf
    fi
+   rm -f /etc/systemd/system/autofs.service.d/cvmfs-autosetup.conf
 fi
 
 %if 0%{?selinux_cvmfs}
@@ -323,6 +393,14 @@ if [ $1 -eq 0 ]; then
     done
 fi
 %endif
+
+%postun server
+%if 0%{?selinux_cvmfs_server}
+if [ $1 -eq 0 ]; then
+  /usr/sbin/semanage port -d -t http_port_t -p tcp 8000 2>/dev/null || :
+fi
+%endif
+
 
 %files
 %defattr(-,root,root)
@@ -335,12 +413,18 @@ fi
 %{_bindir}/cvmfs_fsck
 %{_bindir}/cvmfs_config
 /usr/libexec/cvmfs/auto.cvmfs
+/usr/libexec/cvmfs/authz/cvmfs_allow_helper
+/usr/libexec/cvmfs/authz/cvmfs_deny_helper
+/usr/libexec/cvmfs/cache/cvmfs_cache_ram
 %{_sysconfdir}/auto.cvmfs
 %{_sysconfdir}/cvmfs/config.sh
 %if 0%{?selinux_cvmfs}
 %{_datadir}/selinux/mls/cvmfs.pp
 %{_datadir}/selinux/strict/cvmfs.pp
 %{_datadir}/selinux/targeted/cvmfs.pp
+%endif
+%if 0%{?systemd_autofs_patch}
+/usr/lib/systemd/system/autofs.service.d/50-cvmfs.conf
 %endif
 /sbin/mount.cvmfs
 %dir %{_sysconfdir}/cvmfs/config.d
@@ -351,42 +435,82 @@ fi
 %config %{_sysconfdir}/cvmfs/default.conf
 %dir %{_sysconfdir}/bash_completion.d
 %config(noreplace) %{_sysconfdir}/bash_completion.d/cvmfs
-%doc COPYING AUTHORS README ChangeLog
+%doc COPYING AUTHORS README.md ChangeLog
 
 %files devel
 %defattr(-,root,root)
 %{_libdir}/libcvmfs.a
+%{_libdir}/libcvmfs_cache.a
 %{_includedir}/libcvmfs.h
-%doc COPYING AUTHORS README ChangeLog
+%{_includedir}/libcvmfs_cache.h
+%doc COPYING AUTHORS README.md ChangeLog
 
 %files server
 %defattr(-,root,root)
+%{_bindir}/cvmfs_receiver
 %{_bindir}/cvmfs_swissknife
 %{_bindir}/cvmfs_swissknife_debug
 %{_bindir}/cvmfs_suid_helper
 %{_bindir}/cvmfs_server
+%{_bindir}/cvmfs_rsync
+%{_bindir}/cvmfs_stratum_agent
 %{_sysconfdir}/cvmfs/cvmfs_server_hooks.sh.demo
-%{_libdir}/libtbb_cvmfs.so
-%{_libdir}/libtbb_cvmfs.so.2
-%{_libdir}/libtbbmalloc_cvmfs.so
-%{_libdir}/libtbbmalloc_cvmfs.so.2
-%{_libdir}/libtbb_cvmfs_debug.so
-%{_libdir}/libtbb_cvmfs_debug.so.2
-%{_libdir}/libtbbmalloc_cvmfs_debug.so
-%{_libdir}/libtbbmalloc_cvmfs_debug.so.2
 %dir %{_sysconfdir}/cvmfs/repositories.d
-/var/www/wsgi-scripts/cvmfs-api.wsgi
+/var/www/wsgi-scripts/cvmfs-server/cvmfs-api.wsgi
 /usr/share/cvmfs-server/
 /var/lib/cvmfs-server/
 /var/spool/cvmfs/README
-%doc COPYING AUTHORS README ChangeLog
+%doc COPYING AUTHORS README.md ChangeLog
 
 %files unittests
 %defattr(-,root,root)
 %{_bindir}/cvmfs_unittests
-%doc COPYING AUTHORS README ChangeLog
+%{_bindir}/cvmfs_test_cache
+%doc COPYING AUTHORS README.md ChangeLog
 
 %changelog
+* Mon Sep 18 2017 Jakob Blomer <jblomer@cern.ch> - 2.5.0
+- Add cvmfs_stratum_agent to the cvmfs-server package
+* Wed Aug 02 2017 Jakob Blomer <jblomer@cern.ch> - 2.4.0
+- Fix dependencies for Fedora >= 25
+* Wed Jul 05 2017 Jakob Blomer <jblomer@cern.ch> - 2.4.0
+- Assign port 8000 to httpd in selinux configuration - 2.4.0
+* Thu Jun 29 2017 Jakob Blomer <jblomer@cern.ch> - 2.4.0
+- Add cvmfs_test_cache to unittests sub package
+* Tue May 09 2017 Dave Dykstra <dwd@fnal.gov> - 2.4.0
+- Add cvmfs_receiver
+* Wed Mar 22 2017 Jakob Blomer <jblomer@cern.ch> - 2.4.0
+- Update upstream package
+* Wed Mar 22 2017 Jakob Blomer <jblomer@cern.ch> - 2.3.5
+- Drop systemd patch configuration for autofs where necessary
+* Mon Mar 06 2017 Jakob Blomer <jblomer@cern.ch> - 2.3.4
+- Remove systemd bugfix configuration file if necessary
+* Mon Aug 22 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
+- Reset cvmfs_swissknife capability if overlayfs is used
+* Thu Jul 28 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
+- Update upstream package
+* Thu Jun 30 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
+- Fix SLES12 dist tag
+* Tue May 03 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.0
+- No optimiziation on EL5/i686 to prevent faulty atomics
+* Fri Apr 29 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.0
+- voms-devel not necessary anymore
+* Mon Apr 11 2016 Rene Meusel <rene.meusel@cern.ch> - 2.3.0
+- Disable open repo transaction check in EL4
+* Thu Apr 07 2016 Rene Meusel <rene.meusel@cern.ch> - 2.3.0
+- Check for open repo transactions before updating server package
+* Sat Jan 23 2016 Brian Bockelman <bbockelm@cse.unl.edu> - 2.2.0
+- Build with VOMS support
+* Thu Jan 21 2016 Jakob Blomer <jblomer@cern.ch> - 2.2.0
+- Remove sudo dependency
+* Fri Jan 15 2016 Jakob Blomer <jblomer@cern.ch> - 2.2.0
+- Add valgrind-devel except for EL4
+* Tue Jan 12 2016 Rene Meusel <rene.meusel@cern.ch> - 2.2.0
+- Fix dependency for Fedora 23
+* Tue Dec 15 2015 Jakob Blomer <jblomer@cern.ch> - 2.2.0
+- Unmount repositories when cvmfs is erased
+* Fri Dec 11 2015 Rene Meusel <rene.meusel@cern.ch> - 2.2.0
+- Add jq (weak) dependency
 * Fri Oct 23 2015 Rene Meusel <rene.meusel@cern.ch> - 2.2.0
 - Fix dependency for Fedora 22
 - Add lsof dependency for cvmfs-server

@@ -1,4 +1,4 @@
-usr/share/doc/cvmfs-@CVMFS_VERSION@/README
+usr/share/doc/cvmfs-@CVMFS_VERSION@/README.md
 usr/share/doc/cvmfs-@CVMFS_VERSION@/AUTHORS
 usr/share/doc/cvmfs-@CVMFS_VERSION@/ChangeLog
 usr/share/doc/cvmfs-@CVMFS_VERSION@/COPYING
@@ -11,6 +11,9 @@ usr/lib/libcvmfs_fuse_debug.so
 usr/bin/cvmfs_talk
 usr/bin/cvmfs_config
 usr/libexec/cvmfs/auto.cvmfs
+usr/libexec/cvmfs/authz/cvmfs_allow_helper
+usr/libexec/cvmfs/authz/cvmfs_deny_helper
+usr/libexec/cvmfs/cache/cvmfs_cache_ram
 etc/auto.cvmfs
 sbin/mount.cvmfs
 etc/cvmfs/config.sh

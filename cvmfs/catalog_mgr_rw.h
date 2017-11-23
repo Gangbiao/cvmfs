@@ -32,12 +32,15 @@
 #include <pthread.h>
 #include <stdint.h>
 
+#include <map>
 #include <set>
 #include <string>
 
 #include "catalog_mgr_ro.h"
 #include "catalog_rw.h"
+#include "file_chunk.h"
 #include "upload_spooler_result.h"
+#include "util_concurrency.h"
 #include "xattr.h"
 
 class XattrList;
@@ -65,14 +68,21 @@ class CatalogBalancer;
 namespace catalog {
 
 class WritableCatalogManager : public SimpleCatalogManager {
- public:
   friend class CatalogBalancer<WritableCatalogManager>;
+  // TODO(jblomer): only needed to get Spooler's hash algorithm.  Remove me
+  // after refactoring of the swissknife utility.
+  friend class VirtualCatalog;
+
+ public:
   WritableCatalogManager(const shash::Any  &base_hash,
                          const std::string &stratum0,
                          const std::string &dir_temp,
                          upload::Spooler   *spooler,
                          download::DownloadManager *download_manager,
-                         uint64_t catalog_entry_warn_threshold,
+                         bool enforce_limits,
+                         const unsigned nested_kcatalog_limit,
+                         const unsigned root_kcatalog_limit,
+                         const unsigned file_mbyte_limit,
                          perf::Statistics *statistics,
                          bool is_balanceable,
                          unsigned max_weight,
@@ -80,7 +90,7 @@ class WritableCatalogManager : public SimpleCatalogManager {
   ~WritableCatalogManager();
   static manifest::Manifest *CreateRepository(const std::string &dir_temp,
                                               const bool volatile_content,
-                                              const bool garbage_collectable,
+                                              const std::string &voms_authz,
                                               upload::Spooler   *spooler);
 
   // DirectoryEntry handling
@@ -105,13 +115,16 @@ class WritableCatalogManager : public SimpleCatalogManager {
   // Hardlink group handling
   void AddHardlinkGroup(const DirectoryEntryBaseList &entries,
                         const XattrList &xattrs,
-                        const std::string &parent_directory);
+                        const std::string &parent_directory,
+                        const FileChunkList &file_chunks);
   void ShrinkHardlinkGroup(const std::string &remove_path);
 
   // Nested catalog handling
   void CreateNestedCatalog(const std::string &mountpoint);
-  void RemoveNestedCatalog(const std::string &mountpoint);
-  bool IsTransitionPoint(const std::string &path);
+  void RemoveNestedCatalog(const std::string &mountpoint,
+                           const bool merge = true);
+  bool IsTransitionPoint(const std::string &mountpoint);
+  WritableCatalog *GetHostingCatalog(const std::string &path);
 
   inline bool IsBalanceable() const { return is_balanceable_; }
   /**
@@ -119,8 +132,12 @@ class WritableCatalogManager : public SimpleCatalogManager {
    */
   void PrecalculateListings();
 
-  manifest::Manifest *Commit(const bool     stop_for_tweaks,
-                             const uint64_t manual_revision);
+  void SetTTL(const uint64_t new_ttl);
+  bool SetVOMSAuthz(const std::string &voms_authz);
+  bool Commit(const bool           stop_for_tweaks,
+              const uint64_t       manual_revision,
+              manifest::Manifest  *manifest);
+
   void Balance() {
       if (IsBalanceable()) {
           DoBalance();
@@ -143,15 +160,46 @@ class WritableCatalogManager : public SimpleCatalogManager {
                const std::string     &parent_directory);
 
  private:
-  bool FindCatalog(const std::string &path, WritableCatalog **result);
+  bool FindCatalog(const std::string  &path,
+                   WritableCatalog   **result,
+                   DirectoryEntry     *dirent = NULL);
   void DoBalance();
   void FixWeight(WritableCatalog *catalog);
 
-  /**
-   * Traverses all open catalogs and determines which catalogs need updated
-   * snapshots.
-   * @param[out] result the list of catalogs to snapshot
-   */
+  struct CatalogInfo {
+    uint64_t     ttl;
+    size_t       size;
+    shash::Any   content_hash;
+    unsigned int revision;
+  };
+
+  struct CatalogUploadContext {
+    Future<CatalogInfo>* root_catalog_info;
+    bool                 stop_for_tweaks;
+  };
+
+  CatalogInfo SnapshotCatalogs(const bool stop_for_tweaks);
+  void FinalizeCatalog(WritableCatalog *catalog,
+                       const bool stop_for_tweaks);
+  void ScheduleCatalogProcessing(WritableCatalog *catalog);
+
+  void GetModifiedCatalogLeafs(WritableCatalogList *result) const {
+    const bool dirty = GetModifiedCatalogLeafsRecursively(GetRootCatalog(),
+                                                          result);
+    assert(dirty);
+  }
+  bool GetModifiedCatalogLeafsRecursively(Catalog             *catalog,
+                                          WritableCatalogList *result) const;
+
+  void CatalogUploadCallback(const upload::SpoolerResult &result,
+                             const CatalogUploadContext   clg_upload_context);
+
+ private:
+  inline void SyncLock() { pthread_mutex_lock(sync_lock_); }
+  inline void SyncUnlock() { pthread_mutex_unlock(sync_lock_); }
+
+  //****************************************************************************
+  // Workaround -- Serialized Catalog Committing
   void GetModifiedCatalogs(WritableCatalogList *result) const {
     const unsigned int number_of_dirty_catalogs =
       GetModifiedCatalogsRecursively(GetRootCatalog(), result);
@@ -159,13 +207,11 @@ class WritableCatalogManager : public SimpleCatalogManager {
   }
   int GetModifiedCatalogsRecursively(const Catalog *catalog,
                                      WritableCatalogList *result) const;
-
-  shash::Any SnapshotCatalog(WritableCatalog *catalog) const;
-  void CatalogUploadCallback(const upload::SpoolerResult &result);
-
- private:
-  inline void SyncLock() { pthread_mutex_lock(sync_lock_); }
-  inline void SyncUnlock() { pthread_mutex_unlock(sync_lock_); }
+  void CatalogUploadSerializedCallback(
+    const upload::SpoolerResult &result,
+    const CatalogUploadContext unused);
+  CatalogInfo SnapshotCatalogsSerialized(const bool stop_for_tweaks);
+  //****************************************************************************
 
   // defined in catalog_mgr_rw.cc
   static const std::string kCatalogFilename;
@@ -174,7 +220,14 @@ class WritableCatalogManager : public SimpleCatalogManager {
   pthread_mutex_t *sync_lock_;
   upload::Spooler *spooler_;
 
-  uint64_t catalog_entry_warn_threshold_;
+  pthread_mutex_t                         *catalog_processing_lock_;
+  std::map<std::string, WritableCatalog*>  catalog_processing_map_;
+
+  // TODO(jblomer): catalog limits should become its own struct
+  bool enforce_limits_;
+  unsigned nested_kcatalog_limit_;
+  unsigned root_kcatalog_limit_;
+  unsigned file_mbyte_limit_;
 
   /**
    * Directories don't have extended attributes at this point.

@@ -10,19 +10,28 @@
 #include <alloca.h>
 #include <dirent.h>
 #include <fcntl.h>
+#if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
+    __MAC_OS_X_VERSION_MIN_REQUIRED >= 101200
+#include <os/lock.h>  // NOLINT
+#else
 #include <libkern/OSAtomic.h>
-#include <mach/mach.h>
+#endif  //  defined(__MAC_OS_X_VERSION_MIN_REQUIRED) &&
+        //  __MAC_OS_X_VERSION_MIN_REQUIRED >= 101200
 #include <mach-o/dyld.h>
+#include <mach/mach.h>  // NOLINT
+#include <mach/mach_time.h>
 #include <signal.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 #include <sys/ucred.h>
 #include <sys/xattr.h>
 
 #include <cassert>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <string>
@@ -47,6 +56,7 @@ namespace CVMFS_NAMESPACE_GUARD {
  */
 #define HOST_NAME_MAX _POSIX_HOST_NAME_MAX
 
+#define platform_sighandler_t sig_t
 
 inline std::vector<std::string> platform_mountlist() {
   std::vector<std::string> result;
@@ -58,38 +68,58 @@ inline std::vector<std::string> platform_mountlist() {
   return result;
 }
 
-
 inline bool platform_umount(const char *mountpoint, const bool lazy) {
   const int flags = lazy ? MNT_FORCE : 0;
   int retval = unmount(mountpoint, flags);
   return retval == 0;
 }
 
-
 /**
  * Spinlocks on OS X are not in pthread but in OS X specific APIs.
  */
+#if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
+    __MAC_OS_X_VERSION_MIN_REQUIRED >= 101200
+typedef os_unfair_lock platform_spinlock;
+
+inline int platform_spinlock_init(platform_spinlock *lock, int /*pshared*/) {
+  *lock = OS_UNFAIR_LOCK_INIT;
+  return 0;
+}
+
+inline int platform_spinlock_destroy(platform_spinlock * /*lock*/) { return 0; }
+
+inline int platform_spinlock_trylock(platform_spinlock *lock) {
+  return os_unfair_lock_trylock(lock) ? 0 : -1;
+}
+
+inline void platform_spinlock_unlock(platform_spinlock *lock) {
+  os_unfair_lock_unlock(lock);
+}
+
+#else
 typedef OSSpinLock platform_spinlock;
 
-inline int platform_spinlock_init(platform_spinlock *lock, int pshared) {
+inline int platform_spinlock_init(platform_spinlock *lock, int /*pshared*/) {
   *lock = 0;
   return 0;
 }
 
-inline int platform_spinlock_destroy(platform_spinlock *lock) { return 0; }
+inline int platform_spinlock_destroy(platform_spinlock * /*lock*/) { return 0; }
 
 inline int platform_spinlock_trylock(platform_spinlock *lock) {
-  return (OSSpinLockTry(lock)) ? 0 : -1;
+  return OSSpinLockTry(lock) ? 0 : -1;
 }
 
+inline void platform_spinlock_unlock(platform_spinlock *lock) {
+  OSSpinLockUnlock(lock);
+}
+
+#endif
 
 /**
  * pthread_self() is not necessarily an unsigned long.
  */
-inline thread_port_t platform_gettid() {
-  return mach_thread_self();
-}
-
+inline thread_port_t platform_gettid() { return mach_thread_self(); }
 
 inline int platform_sigwait(const int signum) {
   sigset_t sigset;
@@ -110,7 +140,6 @@ inline bool platform_allow_ptrace(const pid_t pid) {
   // No-op on Mac OS X
   return true;
 }
-
 
 /**
  * File system functions, Mac OS X has 64bit functions by default.
@@ -134,8 +163,7 @@ inline int platform_fstat(int filedes, platform_stat64 *buf) {
 }
 
 inline bool platform_getxattr(const std::string &path, const std::string &name,
-                              std::string *value)
-{
+                              std::string *value) {
   int size = 0;
   void *buffer = NULL;
   int retval;
@@ -158,35 +186,31 @@ inline bool platform_getxattr(const std::string &path, const std::string &name,
   return true;
 }
 
-inline bool platform_setxattr(
-  const std::string &path,
-  const std::string &name,
-  const std::string &value)
-{
-  int retval = setxattr(
-    path.c_str(), name.c_str(), value.c_str(), value.size(), 0, 0);
+inline bool platform_setxattr(const std::string &path, const std::string &name,
+                              const std::string &value) {
+  int retval =
+      setxattr(path.c_str(), name.c_str(), value.c_str(), value.size(), 0, 0);
   return retval == 0;
 }
 
-
-inline ssize_t platform_lgetxattr(
-  const char *path,
-  const char *name,
-  void *value,
-  size_t size
-) {
+inline ssize_t platform_lgetxattr(const char *path, const char *name,
+                                  void *value, size_t size) {
   return getxattr(path, name, value, size, 0 /* position */, XATTR_NOFOLLOW);
 }
-
 
 inline ssize_t platform_llistxattr(const char *path, char *list, size_t size) {
   return listxattr(path, list, size, XATTR_NOFOLLOW);
 }
 
-
 inline void platform_disable_kcache(int filedes) {
   fcntl(filedes, F_RDAHEAD, 0);
   fcntl(filedes, F_NOCACHE, 1);
+}
+
+inline void platform_invalidate_kcache(const int fd, const off_t offset,
+                                       const size_t length) {
+  // NOOP
+  // TODO(rmeusel): implement
 }
 
 inline int platform_readahead(int filedes) {
@@ -195,8 +219,8 @@ inline int platform_readahead(int filedes) {
 }
 
 inline bool read_line(FILE *f, std::string *line) {
-  char   *buffer_line = NULL;
-  size_t  buffer_size = 0;
+  char *buffer_line = NULL;
+  size_t buffer_size = 0;
   const int res = getline(&buffer_line, &buffer_size, f);
   if (res < 0) {
     free(buffer_line);
@@ -209,60 +233,44 @@ inline bool read_line(FILE *f, std::string *line) {
   return true;
 }
 
-inline void platform_get_os_version(int32_t *major,
-                                    int32_t *minor,
-                                    int32_t *patch) {
-  const std::string plist = "/System/Library/CoreServices/SystemVersion.plist";
-  const std::string plist_key = "ProductVersion";
-
-  FILE *plist_file = fopen(plist.c_str(), "r");
-  assert(plist_file != NULL && "couldn't open SystemVersion.plist");
-
-  std::string line;
-  bool found_key = false;
-  while (read_line(plist_file, &line) && !found_key) {
-    if (line.find(plist_key) != std::string::npos) {
-      found_key = true;
-      break;
-    }
-  }
-  assert(found_key && "didn't find key in SystemVersion.plist");
-
-  const std::string start_tag = "<string>";
-  const std::string end_tag   = "</string>";
-  size_t start, end;
-  bool found_value = false;
-  while (read_line(plist_file, &line) && !found_value) {
-    start = line.find(start_tag);
-    end   = line.find(end_tag);
-    if (start != std::string::npos && end != std::string::npos) {
-      found_value = true;
-      break;
-    }
-  }
-  assert(found_value && "didn't find value in SystemVersion.plist");
-  fclose(plist_file);
-
-  start = start + start_tag.length();
-  const std::string version = line.substr(start, end - start);
-  const int matches = sscanf(version.c_str(), "%u.%u.%u", major, minor, patch);
-  assert(matches == 3 && "failed to read OS X version string");
+inline uint64_t platform_monotonic_time() {
+  uint64_t val_abs = mach_absolute_time();
+  // Doing the conversion every time is slow but thread-safe
+  mach_timebase_info_data_t info;
+  mach_timebase_info(&info);
+  uint64_t val_ns = val_abs * (info.numer / info.denom);
+  return val_ns * 1e-9;
 }
 
 /**
  * strdupa does not exist on OSX
  */
-#define strdupa(s) strcpy(/* NOLINT(runtime/printf) */\
-  reinterpret_cast<char *>(alloca(strlen((s)) + 1)), (s))
-
+#define strdupa(s)                    \
+  strcpy(/* NOLINT(runtime/printf) */ \
+         reinterpret_cast<char *>(alloca(strlen((s)) + 1)), (s))
 
 inline std::string platform_libname(const std::string &base_name) {
   return "lib" + base_name + ".dylib";
 }
 
-inline const char* platform_getexepath() {
-  static const char* path = _dyld_get_image_name(0);
+inline const char *platform_getexepath() {
+  static const char *path = _dyld_get_image_name(0);
   return path;
+}
+
+/**
+ * sysconf() is broken on OSX
+ */
+inline uint64_t platform_memsize() {
+  int mib[] = {CTL_HW, HW_MEMSIZE};
+  int64_t ramsize;
+  int rc;
+  size_t len;
+
+  len = sizeof(ramsize);
+  rc = sysctl(mib, 2, &ramsize, &len, NULL, 0);
+  assert(rc == 0);
+  return ramsize;
 }
 
 #ifdef CVMFS_NAMESPACE_GUARD

@@ -4,8 +4,11 @@
 
 #include <gtest/gtest.h>
 
-#include "../../cvmfs/lru.h"
-#include "../../cvmfs/statistics.h"
+#include <string>
+
+#include "lru.h"
+#include "statistics.h"
+#include "util/string.h"
 
 using lru::LruCache;
 
@@ -20,7 +23,7 @@ const std::string name = "lru_cache";
 TEST(T_LruCache, Initialize) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 }
@@ -29,7 +32,7 @@ TEST(T_LruCache, Initialize) {
 TEST(T_LruCache, Insert) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -48,10 +51,69 @@ TEST(T_LruCache, Insert) {
 }
 
 
+TEST(T_LruCache, UpdateValue) {
+  perf::Statistics statistics;
+  LruCache<int, std::string> cache(cache_size, -1, hasher_int,
+      perf::StatisticsTemplate(name, &statistics));
+
+  EXPECT_TRUE(cache.Insert(1, "one"));
+  EXPECT_TRUE(cache.Insert(2, "two"));
+  EXPECT_FALSE(cache.IsFull());
+  unsigned i = 3;
+  for (; !cache.IsFull(); ++i) {
+    cache.Insert(i, "");
+  }
+  EXPECT_EQ(0U, statistics.Lookup(name + ".n_replace")->Get());
+
+  EXPECT_FALSE(cache.UpdateValue(i, "BIGNUMBER"));
+  EXPECT_TRUE(cache.UpdateValue(1, "ONE"));
+
+  std::string value;
+  EXPECT_TRUE(cache.Lookup(1, &value));
+  EXPECT_EQ("ONE", value);
+
+  EXPECT_TRUE(cache.UpdateValue(2, "TWO"));
+  // Overflow, 2 should be removed, and not be the "newest" entry after
+  // UpdateValue
+  cache.Insert(i, "");
+  EXPECT_EQ(1U, statistics.Lookup(name + ".n_replace")->Get());
+  EXPECT_FALSE(cache.Lookup(2, &value));
+}
+
+
+TEST(T_LruCache, UpdateOnly) {
+  perf::Statistics statistics;
+  LruCache<int, std::string> cache(cache_size, -1, hasher_int,
+      perf::StatisticsTemplate(name, &statistics));
+
+  EXPECT_TRUE(cache.Insert(1, "one"));
+  EXPECT_TRUE(cache.Insert(2, "two"));
+
+  int key;
+  std::string value;
+  cache.FilterBegin();
+  EXPECT_TRUE(cache.FilterNext());
+  cache.FilterGet(&key, &value);
+  EXPECT_EQ(1, key);
+  cache.FilterEnd();
+
+  cache.Update(1);
+  cache.FilterBegin();
+  EXPECT_TRUE(cache.FilterNext());
+  cache.FilterGet(&key, &value);
+  EXPECT_EQ(2, key);
+  cache.FilterEnd();
+
+  EXPECT_DEATH(cache.Update(3), ".*");
+  cache.Pause();
+  EXPECT_DEATH(cache.Update(1), ".*");
+}
+
+
 TEST(T_LruCache, Drop) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -103,7 +165,7 @@ TEST(T_LruCache, Drop) {
 TEST(T_LruCache, Lookup) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -166,7 +228,7 @@ TEST(T_LruCache, Lookup) {
 TEST(T_LruCache, Update) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -231,7 +293,7 @@ TEST(T_LruCache, Update) {
 TEST(T_LruCache, Forget) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -298,7 +360,7 @@ TEST(T_LruCache, Forget) {
 TEST(T_LruCache, FillCompletely) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -327,7 +389,7 @@ TEST(T_LruCache, FillCompletely) {
 TEST(T_LruCache, LeastRecentlyUsedReplacementSlow) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 
@@ -343,13 +405,14 @@ TEST(T_LruCache, LeastRecentlyUsedReplacementSlow) {
   std::string v;
   const std::string neg = "notfound";
 
-  // lookup a couple of entries to make then "Least Recently Used"
+  // lookup a couple of entries to make then "Least Recently Used" except for
+  // the last one
   found = cache.Lookup(2, &v); EXPECT_TRUE(found); EXPECT_EQ("2", v);
   found = cache.Lookup(4, &v); EXPECT_TRUE(found); EXPECT_EQ("4", v);
   found = cache.Lookup(5, &v); EXPECT_TRUE(found); EXPECT_EQ("5", v);
   found = cache.Lookup(6, &v); EXPECT_TRUE(found); EXPECT_EQ("6", v);
   found = cache.Lookup(7, &v); EXPECT_TRUE(found); EXPECT_EQ("7", v);
-  found = cache.Lookup(9, &v); EXPECT_TRUE(found); EXPECT_EQ("9", v);
+  found = cache.Lookup(9, &v, false); EXPECT_TRUE(found); EXPECT_EQ("9", v);
 
   EXPECT_FALSE(cache.IsEmpty());
   EXPECT_TRUE(cache.IsFull());
@@ -368,7 +431,7 @@ TEST(T_LruCache, LeastRecentlyUsedReplacementSlow) {
   found = cache.Lookup(5, &v); EXPECT_TRUE(found); EXPECT_EQ("5", v);
   found = cache.Lookup(6, &v); EXPECT_TRUE(found); EXPECT_EQ("6", v);
   found = cache.Lookup(7, &v); EXPECT_TRUE(found); EXPECT_EQ("7", v);
-  found = cache.Lookup(9, &v); EXPECT_TRUE(found); EXPECT_EQ("9", v);
+  found = cache.Lookup(9, &v); EXPECT_FALSE(found);
 
   v = neg;
   found = cache.Lookup(8, &v); EXPECT_FALSE(found); EXPECT_EQ(neg, v);
@@ -393,7 +456,7 @@ TEST(T_LruCache, LeastRecentlyUsedReplacementSlow) {
 TEST(T_LruCache, PauseAndResume) {
   perf::Statistics statistics;
   LruCache<int, std::string> cache(cache_size, -1, hasher_int,
-      &statistics, name);
+      perf::StatisticsTemplate(name, &statistics));
   EXPECT_TRUE(cache.IsEmpty());
   EXPECT_FALSE(cache.IsFull());
 

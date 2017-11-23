@@ -33,17 +33,21 @@ namespace shash {
 /**
  * Don't change order!  The integer value of the enum constants is used
  * as file catalog flags and as flags in communication with the cache manager.
+ * If algorithms are added, the protocol definition for external cache managers
+ * needs to be updated, too.
  */
 enum Algorithms {
   kMd5 = 0,
   kSha1,
   kRmd160,
-  kSha256,
-  kSha3,
   kShake128,  // with 160 output bits
   kAny,
 };
 
+/**
+ * NOTE: when adding a suffix here, one must edit `cvmfs_swissknife scrub`
+ *       accordingly, that checks for invalid hash suffixes
+ */
 const char kSuffixNone         = 0;
 const char kSuffixCatalog      = 'C';
 const char kSuffixHistory      = 'H';
@@ -51,27 +55,30 @@ const char kSuffixMicroCatalog = 'L';  // currently unused
 const char kSuffixPartial      = 'P';
 const char kSuffixTemporary    = 'T';
 const char kSuffixCertificate  = 'X';
+const char kSuffixMetainfo     = 'M';
 
 
 /**
  * Corresponds to Algorithms.  "Any" is the maximum of all the other
  * digest sizes.
+ * When the maximum digest size changes, the memory layout of DirectoryEntry and
+ * PosixQuotaManager::LruCommand changes, too!
  */
 const unsigned kDigestSizes[] =
-  {16,  20,   20,     32,     32,       20,       32};
-// Md5  Sha1  Rmd160  Sha256  Sha3-256  Shake128  Any
-const unsigned kMaxDigestSize = 32;
+  {16,  20,   20,     20,       20};
+// Md5  Sha1  Rmd160  Shake128  Any
+const unsigned kMaxDigestSize = 20;
 
 /**
  * Hex representations of hashes with the same length need a suffix
  * to be distinguished from each other.  They should all have one but
  * for backwards compatibility MD5 and SHA-1 have none.  Initialized in hash.cc
- * like const char *kAlgorithmIds[] = {"", "", "-rmd160", "-sha256", ...
+ * like const char *kAlgorithmIds[] = {"", "", "-rmd160", ...
  */
 extern const char *kAlgorithmIds[];
 const unsigned kAlgorithmIdSizes[] =
-  {0,   0,    7,       7,       5,     9,         0};
-// Md5  Sha1  -rmd160  -sha256  -sha3  -shake128  Any
+  {0,   0,    7,       9,         0};
+// Md5  Sha1  -rmd160  -shake128  Any
 const unsigned kMaxAlgorithmIdentifierSize = 9;
 
 /**
@@ -79,8 +86,8 @@ const unsigned kMaxAlgorithmIdentifierSize = 9;
  * Is an HMAC for SHAKE well-defined?
  */
 const unsigned kBlockSizes[] =
-  {64,  64,   64,     64,     136,  168};
-// Md5  Sha1  Rmd160  Sha256  Sha3  Shake128
+  {64,  64,   64,     168};
+// Md5  Sha1  Rmd160  Shake128
 
 /**
  * Distinguishes between interpreting a string as hex hash and hashing over
@@ -157,7 +164,7 @@ struct Digest {
   Digest() :
     algorithm(algorithm_), suffix(kSuffixNone)
   {
-    memset(digest, 0, digest_size_);
+    SetNull();
   }
 
   explicit Digest(const Algorithms a, const HexPtr hex, const char s = 0) :
@@ -251,7 +258,7 @@ struct Digest {
   /**
    * Generates a hexified repesentation of the digest including the identifier
    * string for newly added hashes.  Output is in the form of
-   * 'openssl x509 fingerprint', e.g. 00:AA:BB:...-SHA3
+   * 'openssl x509 fingerprint', e.g. 00:AA:BB:...-SHAKE128
    *
    * @param with_suffix  append the hash suffix (C,H,X, ...) to the result
    * @return             a string representation of the digest
@@ -299,6 +306,15 @@ struct Digest {
    */
   std::string MakePath() const {
     return MakePathExplicit(1, 2, suffix);
+  }
+
+  /**
+   * The alternative path is used to symlink the root catalog from the webserver
+   * root to the data directory.  This way, the data directory can be protected
+   * while the root catalog remains accessible.
+   */
+  std::string MakeAlternativePath() const {
+    return ".cvmfsalt-" + ToStringWithSuffix();
   }
 
   /**
@@ -362,6 +378,12 @@ struct Digest {
     return true;
   }
 
+
+  void SetNull() {
+    memset(digest, 0, digest_size_);
+  }
+
+
   bool operator ==(const Digest<digest_size_, algorithm_> &other) const {
     if (this->algorithm != other.algorithm)
       return false;
@@ -416,8 +438,6 @@ struct Md5 : public Digest<16, kMd5> {
 
 struct Sha1 : public Digest<20, kSha1> { };
 struct Rmd160 : public Digest<20, kRmd160> { };
-struct Sha256 : public Digest<32, kSha256> { };
-struct Sha3 : public Digest<32, kSha3> { };
 struct Shake128 : public Digest<20, kShake128> { };
 
 /**
@@ -441,6 +461,8 @@ struct Any : public Digest<kMaxDigestSize, kAny> {
                const HexPtr      hex,
                const char        suffix = kSuffixNone) :
     Digest<kMaxDigestSize, kAny>(a, hex, suffix) { }
+
+  Md5 CastToMd5();
 };
 
 
@@ -471,16 +493,26 @@ void Update(const unsigned char *buffer, const unsigned buffer_size,
             ContextPtr context);
 void Final(ContextPtr context, Any *any_digest);
 bool HashFile(const std::string &filename, Any *any_digest);
+bool HashFd(int fd, Any *any_digest);
 void HashMem(const unsigned char *buffer, const unsigned buffer_size,
              Any *any_digest);
 void HashString(const std::string &content, Any *any_digest);
 void Hmac(const std::string &key,
           const unsigned char *buffer, const unsigned buffer_size,
           Any *any_digest);
+inline void HmacString(const std::string &key, const std::string &content,
+                       Any *any_digest)
+{
+  Hmac(key,
+       reinterpret_cast<const unsigned char *>(content.data()),
+       content.size(),
+       any_digest);
+}
 
 
 Algorithms ParseHashAlgorithm(const std::string &algorithm_option);
 Any MkFromHexPtr(const HexPtr hex, const Suffix suffix = kSuffixNone);
+Any MkFromSuffixedHexPtr(const HexPtr hex);
 
 }  // namespace shash
 

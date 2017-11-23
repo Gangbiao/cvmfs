@@ -5,6 +5,8 @@
 #ifndef CVMFS_SIGNATURE_H_
 #define CVMFS_SIGNATURE_H_
 
+#include <pthread.h>
+
 #include <openssl/bio.h>
 #include <openssl/engine.h>
 #include <openssl/err.h>
@@ -45,8 +47,8 @@ class SignatureManager {
   static shash::Any MkFromFingerprint(const std::string &fingerprint);
 
   bool LoadPublicRsaKeys(const std::string &path_list);
-  bool LoadBlacklist(const std::string &path_blacklist);
-  std::vector<std::string> GetBlacklistedCertificates();
+  bool LoadBlacklist(const std::string &path_blacklist, bool append);
+  std::vector<std::string> GetBlacklist();
 
   bool LoadTrustedCaCrl(const std::string &path_list);
 
@@ -67,13 +69,20 @@ class SignatureManager {
                         unsigned *letter_length,
                         unsigned *pos_after_mark);
 
+  // Returns the PEM-encoded text of all loaded pubkeys (both raw RSA keys
+  // and that from the current certificate).
+  std::string GetActivePubkeys();
+
  private:
+  std::string GenerateKeyText(RSA *pubkey);
+
   void InitX509Store();
 
   EVP_PKEY *private_key_;
   X509 *certificate_;
   std::vector<RSA *> public_keys_;  /**< Contains cvmfs public master keys */
-  std::vector<std::string> blacklisted_certificates_;
+  pthread_mutex_t lock_blacklist_;
+  std::vector<std::string> blacklist_;
   X509_STORE *x509_store_;
   X509_LOOKUP *x509_lookup_;
 };  // class SignatureManager

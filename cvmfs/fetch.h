@@ -16,7 +16,6 @@
 #include "gtest/gtest_prod.h"
 #include "hash.h"
 #include "sink.h"
-#include "util.h"
 
 class BackoffThrottle;
 
@@ -33,7 +32,7 @@ namespace cvmfs {
  */
 class TransactionSink : public Sink {
  public:
-  TransactionSink(cache::CacheManager *cache_mgr, void *open_txn)
+  TransactionSink(CacheManager *cache_mgr, void *open_txn)
     : cache_mgr_(cache_mgr)
     , open_txn_(open_txn)
   { }
@@ -46,7 +45,7 @@ class TransactionSink : public Sink {
   }
 
  private:
-  cache::CacheManager *cache_mgr_;
+  CacheManager *cache_mgr_;
   void *open_txn_;
 };
 
@@ -68,17 +67,22 @@ class Fetcher : SingleCopy {
   friend void TLSDestructor(void *data);
 
  public:
-  Fetcher(cache::CacheManager *cache_mgr,
+  Fetcher(CacheManager *cache_mgr,
           download::DownloadManager *download_mgr,
           BackoffThrottle *backoff_throttle,
-          perf::Statistics *statistics);
+          perf::StatisticsTemplate statistics,
+          bool external_data = false);
   ~Fetcher();
+  // TODO(jblomer): reduce number of arguments
   int Fetch(const shash::Any &id,
             const uint64_t size,
             const std::string &name,
-            const cache::CacheManager::ObjectType object_type);
+            const zlib::Algorithms compression_algorithm,
+            const CacheManager::ObjectType object_type,
+            const std::string &alt_url = "",
+            off_t range_offset = -1);
 
-  cache::CacheManager *cache_mgr() { return cache_mgr_; }
+  CacheManager *cache_mgr() { return cache_mgr_; }
   download::DownloadManager *download_mgr() { return download_mgr_; }
 
  private:
@@ -91,6 +95,7 @@ class Fetcher : SingleCopy {
     ThreadLocalStorage() {
       pipe_wait[0] = -1;
       pipe_wait[1] = -1;
+      fetcher = NULL;
     }
 
     /**
@@ -128,7 +133,14 @@ class Fetcher : SingleCopy {
                             ThreadLocalStorage *tls);
   int OpenSelect(const shash::Any &id,
                  const std::string &name,
-                 const cache::CacheManager::ObjectType object_type);
+                 const CacheManager::ObjectType object_type);
+
+  /**
+   * If set to true, this fetcher is in 'external data' mode:
+   * instead of constructing the to-be-downloaded URL from the entry hash,
+   * it will use the filename.
+   */
+  bool external_;
 
   /**
    * Key to the thread's ThreadLocalStorage memory
@@ -145,7 +157,7 @@ class Fetcher : SingleCopy {
   std::vector<ThreadLocalStorage *> tls_blocks_;
   pthread_mutex_t *lock_tls_blocks_;
 
-  cache::CacheManager *cache_mgr_;
+  CacheManager *cache_mgr_;
   download::DownloadManager *download_mgr_;
   BackoffThrottle *backoff_throttle_;
   perf::Counter *n_downloads;

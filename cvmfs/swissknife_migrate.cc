@@ -11,6 +11,8 @@
 
 #include "catalog_rw.h"
 #include "catalog_sql.h"
+#include "catalog_virtual.h"
+#include "hash.h"
 #include "logging.h"
 
 using namespace std;  // NOLINT
@@ -31,7 +33,7 @@ CommandMigrate::CommandMigrate() :
 }
 
 
-ParameterList CommandMigrate::GetParams() {
+ParameterList CommandMigrate::GetParams() const {
   ParameterList r;
   r.push_back(Parameter::Mandatory('v',
     "migration base version ( 2.0.x | 2.1.7 | chown | hardlink )"));
@@ -46,6 +48,7 @@ ParameterList CommandMigrate::GetParams() {
   r.push_back(Parameter::Optional('g',
     "group id to be used for this repository"));
   r.push_back(Parameter::Optional('n', "fully qualified repository name"));
+  r.push_back(Parameter::Optional('h', "root hash (other than trunk)"));
   r.push_back(Parameter::Optional('k', "repository master key(s)"));
   r.push_back(Parameter::Optional('i', "UID map for chown"));
   r.push_back(Parameter::Optional('j', "GID map for chown"));
@@ -71,7 +74,7 @@ static void Error(const std::string                     &message,
 
 
 static void Error(const std::string                     &message,
-                  const catalog::Sql                    &statement,
+                  const catalog::SqlCatalog             &statement,
                   const CommandMigrate::PendingCatalog  *catalog) {
   const std::string err_msg =
     message + "\n"
@@ -82,6 +85,7 @@ static void Error(const std::string                     &message,
 
 
 int CommandMigrate::Main(const ArgumentList &args) {
+  shash::Any manual_root_hash;
   const std::string &migration_base     = *args.find('v')->second;
   const std::string &repo_url           = *args.find('r')->second;
   const std::string &spooler            = *args.find('u')->second;
@@ -108,6 +112,10 @@ int CommandMigrate::Main(const ArgumentList &args) {
   const bool fix_transition_points      = (args.count('f') > 0);
   const bool analyze_file_linkcounts    = (args.count('l') == 0);
   const bool collect_catalog_statistics = (args.count('s') > 0);
+  if (args.count('h') > 0) {
+    manual_root_hash = shash::MkFromHexPtr(shash::HexPtr(
+      *args.find('h')->second), shash::kSuffixCatalog);
+  }
 
   // We might need a lot of file descriptors
   if (!RaiseFileDescriptorLimit()) {
@@ -139,29 +147,24 @@ int CommandMigrate::Main(const ArgumentList &args) {
   if (IsHttpUrl(repo_url)) {
     typedef HttpObjectFetcher<catalog::WritableCatalog> ObjectFetcher;
 
-    download::DownloadManager   download_manager;
-    signature::SignatureManager signature_manager;
-    download_manager.Init(1, true, g_statistics);
-    signature_manager.Init();
-    if (!signature_manager.LoadPublicRsaKeys(repo_keys)) {
-      LogCvmfs(kLogCatalog, kLogStderr, "Failed to load public key(s)");
+    const bool follow_redirects = false;
+    if (!this->InitDownloadManager(follow_redirects) ||
+        !this->InitVerifyingSignatureManager(repo_keys)) {
+      LogCvmfs(kLogCatalog, kLogStderr, "Failed to init repo connection");
       return 1;
     }
 
     ObjectFetcher fetcher(repo_name,
                           repo_url,
                           tmp_dir,
-                          &download_manager,
-                          &signature_manager);
+                          download_manager(),
+                          signature_manager());
 
-    loading_successful = LoadCatalogs(&fetcher);
-
-    download_manager.Fini();
-    signature_manager.Fini();
+    loading_successful = LoadCatalogs(manual_root_hash, &fetcher);
   } else {
     typedef LocalObjectFetcher<catalog::WritableCatalog> ObjectFetcher;
     ObjectFetcher fetcher(repo_url, tmp_dir);
-    loading_successful = LoadCatalogs(&fetcher);
+    loading_successful = LoadCatalogs(manual_root_hash, &fetcher);
   }
   catalog_loading_stopwatch_.Stop();
 
@@ -372,7 +375,7 @@ void CommandMigrate::CatalogCallback(
 
   hash_string = data.catalog_hash.ToString();
 
-  path = data.catalog->path().ToString();
+  path = data.catalog->mountpoint().ToString();
   if (path.empty()) {
     path = "/";
     root_catalog_ = data.catalog;
@@ -607,6 +610,7 @@ void CommandMigrate::AbstractMigrationWorker<DerivedT>::operator()(
   migration_stopwatch_.Start();
   const bool success = static_cast<DerivedT*>(this)->RunMigration(data) &&
                        UpdateNestedCatalogReferences(data) &&
+                       UpdateCatalogMetadata(data)         &&
                        CollectAndAggregateStatistics(data) &&
                        CleanupNestedCatalogs(data);
   data->success = success;
@@ -632,7 +636,7 @@ bool CommandMigrate::AbstractMigrationWorker<DerivedT>::
     (data->HasNew()) ? data->new_catalog : data->old_catalog;
   const catalog::CatalogDatabase &writable = new_catalog->database();
 
-  catalog::Sql add_nested_catalog(writable,
+  catalog::SqlCatalog add_nested_catalog(writable,
     "INSERT OR REPLACE INTO nested_catalogs (path,   sha1,  size) "
     "                VALUES                 (:path, :sha1, :size);");
 
@@ -671,6 +675,28 @@ bool CommandMigrate::AbstractMigrationWorker<DerivedT>::
 
 template<class DerivedT>
 bool CommandMigrate::AbstractMigrationWorker<DerivedT>::
+     UpdateCatalogMetadata(PendingCatalog *data) const
+{
+  if (!data->HasChanges()) {
+    return true;
+  }
+
+  catalog::WritableCatalog *catalog =
+    (data->HasNew()) ? data->new_catalog : GetWritable(data->old_catalog);
+
+  // Set the previous revision hash in the new catalog to the old catalog
+  // we are doing the whole migration as a new snapshot that does not change
+  // any files, but just applies the necessary data schema migrations
+  catalog->SetPreviousRevision(data->old_catalog->hash());
+  catalog->IncrementRevision();
+  catalog->UpdateLastModified();
+
+  return true;
+}
+
+
+template<class DerivedT>
+bool CommandMigrate::AbstractMigrationWorker<DerivedT>::
      CollectAndAggregateStatistics(PendingCatalog *data) const
 {
   if (!collect_catalog_statistics_) {
@@ -683,7 +709,7 @@ bool CommandMigrate::AbstractMigrationWorker<DerivedT>::
   bool retval;
 
   // Find out the discrepancy between MAX(rowid) and COUNT(*)
-  catalog::Sql wasted_inodes(writable,
+  catalog::SqlCatalog wasted_inodes(writable,
     "SELECT COUNT(*), MAX(rowid) FROM catalog;");
   retval = wasted_inodes.FetchRow();
   if (!retval) {
@@ -726,7 +752,7 @@ bool CommandMigrate::AbstractMigrationWorker<DerivedT>::CleanupNestedCatalogs(
  * both the catalog management and migration classes get updated.
  */
 const float    CommandMigrate::MigrationWorker_20x::kSchema         = 2.5;
-const unsigned CommandMigrate::MigrationWorker_20x::kSchemaRevision = 2;
+const unsigned CommandMigrate::MigrationWorker_20x::kSchemaRevision = 4;
 
 
 template<class DerivedT>
@@ -789,7 +815,7 @@ bool CommandMigrate::MigrationWorker_20x::CreateNewEmptyCatalog(
     UniquePtr<catalog::CatalogDatabase>
       new_clg_db(catalog::CatalogDatabase::Create(clg_db_path));
     if (!new_clg_db.IsValid() ||
-        !new_clg_db->InsertInitialValues(root_path, volatile_content)) {
+        !new_clg_db->InsertInitialValues(root_path, volatile_content, "")) {
       Error("Failed to create database for new catalog");
       unlink(clg_db_path.c_str());
       return false;
@@ -841,7 +867,7 @@ bool CommandMigrate::MigrationWorker_20x::AttachOldCatalogDatabase(
   const catalog::CatalogDatabase &old_catalog = data->old_catalog->database();
   const catalog::CatalogDatabase &new_catalog = data->new_catalog->database();
 
-  catalog::Sql sql_attach_new(new_catalog,
+  catalog::SqlCatalog sql_attach_new(new_catalog,
     "ATTACH '" + old_catalog.filename() + "' AS old;");
   bool retval = sql_attach_new.Execute();
 
@@ -884,7 +910,7 @@ bool CommandMigrate::MigrationWorker_20x::MigrateFileMetadata(
   //     groupid   : this group id can be used for the new catalog schema
   //     inode     : the inodes that were part of a hardlink group before
   //     linkcount : the linkcount for hardlink group id members
-  catalog::Sql sql_create_hardlinks_table(writable,
+  catalog::SqlCatalog sql_create_hardlinks_table(writable,
     "CREATE TEMPORARY TABLE hardlinks "
     "  (  hardlink_group_id  INTEGER PRIMARY KEY AUTOINCREMENT, "
     "     inode              INTEGER, "
@@ -902,7 +928,7 @@ bool CommandMigrate::MigrationWorker_20x::MigrateFileMetadata(
   // in the old style catalogs. The new catalog schema asks for this specific
   // linkcount. Directory linkcount analysis results will be put into this
   // temporary table
-  catalog::Sql sql_create_linkcounts_table(writable,
+  catalog::SqlCatalog sql_create_linkcounts_table(writable,
     "CREATE TEMPORARY TABLE dir_linkcounts "
     "  (  inode      INTEGER PRIMARY KEY, "
     "     linkcount  INTEGER  );");
@@ -932,7 +958,7 @@ bool CommandMigrate::MigrationWorker_20x::MigrateFileMetadata(
   //       check the number of containing directories. They are defined in a the
   //       linked nested catalog and need to be added later on.
   //       (see: MigrateNestedCatalogMountPoints() for details)
-  catalog::Sql sql_dir_linkcounts(writable,
+  catalog::SqlCatalog sql_dir_linkcounts(writable,
     "INSERT INTO dir_linkcounts "
     "  SELECT c1.inode as inode, "
     "         SUM(IFNULL(MIN(c2.inode,1),0)) + 2 as linkcount "
@@ -963,7 +989,7 @@ bool CommandMigrate::MigrationWorker_20x::MigrateFileMetadata(
   //
   // Note: nested catalog mountpoints still need to be treated separately
   //       (see MigrateNestedCatalogMountPoints() for details)
-  catalog::Sql migrate_file_meta_data(writable,
+  catalog::SqlCatalog migrate_file_meta_data(writable,
     "INSERT INTO catalog "
     "  SELECT md5path_1, md5path_2, "
     "         parent_1, parent_2, "
@@ -1020,7 +1046,7 @@ bool CommandMigrate::MigrationWorker_20x::MigrateFileMetadata(
   // Note: The 'schema' is explicitly not copied to the new catalog.
   //       Each catalog contains a revision, which is also copied here and that
   //       is later updated by calling catalog->IncrementRevision()
-  catalog::Sql copy_properties(writable,
+  catalog::SqlCatalog copy_properties(writable,
     "INSERT OR REPLACE INTO properties "
     "  SELECT key, value "
     "  FROM old.properties "
@@ -1030,13 +1056,6 @@ bool CommandMigrate::MigrationWorker_20x::MigrateFileMetadata(
     Error("Failed to migrate the properties table.", copy_properties, data);
     return false;
   }
-
-  // Set the previous revision hash in the new catalog to the old catalog
-  //   we are doing the whole migration as a new snapshot that does not change
-  //   any files, but just bumpes the catalog schema to the latest version
-  data->new_catalog->SetPreviousRevision(data->old_catalog->hash());
-  data->new_catalog->IncrementRevision();
-  data->new_catalog->UpdateLastModified();
 
   return true;
 }
@@ -1062,7 +1081,7 @@ bool CommandMigrate::MigrationWorker_20x::AnalyzeFileLinkcounts(
   //       supported hardlink groups.
   //       Unsupported hardlink groups will be be treated as normal files with
   //       the same content
-  catalog::Sql sql_create_hardlinks_scratch_table(writable,
+  catalog::SqlCatalog sql_create_hardlinks_scratch_table(writable,
     "CREATE TEMPORARY TABLE hl_scratch AS "
     "  SELECT c1.inode AS inode, c1.md5path_1, c1.md5path_2, "
     "         c1.parent_1 as c1p1, c1.parent_2 as c1p2, "
@@ -1083,7 +1102,7 @@ bool CommandMigrate::MigrationWorker_20x::AnalyzeFileLinkcounts(
   // transferred into the new catalog as so called hardlink groups. Unsupported
   // hardlinks need to be discarded and treated as normal files containing the
   // exact same data
-  catalog::Sql fill_linkcount_table_for_files(writable,
+  catalog::SqlCatalog fill_linkcount_table_for_files(writable,
     "INSERT INTO hardlinks (inode, linkcount)"
     "  SELECT inode, count(*) as linkcount "
     "  FROM ( "
@@ -1126,7 +1145,8 @@ bool CommandMigrate::MigrationWorker_20x::AnalyzeFileLinkcounts(
 
   // The file linkcount and hardlink analysis is finished and the scratch table
   // can be deleted...
-  catalog::Sql drop_hardlink_scratch_space(writable, "DROP TABLE hl_scratch;");
+  catalog::SqlCatalog drop_hardlink_scratch_space(writable,
+                                                  "DROP TABLE hl_scratch;");
   retval = drop_hardlink_scratch_space.Execute();
   if (!retval) {
     Error("Failed to remove file linkcount analysis scratch table",
@@ -1136,7 +1156,7 @@ bool CommandMigrate::MigrationWorker_20x::AnalyzeFileLinkcounts(
 
   // Do some statistics if asked for...
   if (collect_catalog_statistics_) {
-    catalog::Sql count_hardlinks(writable,
+    catalog::SqlCatalog count_hardlinks(writable,
       "SELECT count(*), sum(linkcount) FROM hardlinks;");
     retval = count_hardlinks.FetchRow();
     if (!retval) {
@@ -1161,7 +1181,7 @@ bool CommandMigrate::MigrationWorker_20x::MigrateNestedCatalogMountPoints(
   bool retval;
 
   // preparing the SQL statement for nested catalog mountpoint update
-  catalog::Sql update_mntpnt_linkcount(writable,
+  catalog::SqlCatalog update_mntpnt_linkcount(writable,
     "UPDATE catalog "
     "SET hardlinks = :linkcount "
     "WHERE md5path_1 = :md5_1 AND md5path_2 = :md5_2;");
@@ -1306,36 +1326,6 @@ void CommandMigrate::FixNestedCatalogTransitionPoint(
 }
 
 
-/**
- * Queries a single catalog and looks for DirectoryEntrys that have direct
- * children in the same catalog but are marked as 'nested catalog mountpoints'.
- * This is an inconsistent situation, since a mountpoint is supposed to be empty
- * and it's children are stored in the corresponding referenced nested catalog.
- *
- * Note: the user code needs to check if there is a corresponding nested catalog
- *       reference for the found dangling mountpoints. If so, we also have a
- *       bogus state, but it is not reliably fixable automatically. The child-
- *       DirectoryEntrys would be masked by the mounting nested catalog but it
- *       is not clear if we can simply delete them or if this would destroy data.
- */
-class SqlLookupDanglingMountpoints : public catalog::SqlLookup {
- public:
-  explicit SqlLookupDanglingMountpoints(
-    const catalog::CatalogDatabase &database)
-  {
-    const string statement =
-      "SELECT DISTINCT " +
-      GetFieldsToSelect(database.schema_version(), database.schema_revision()) +
-      " FROM catalog "
-      "JOIN catalog AS c2 "
-      "ON catalog.md5path_1 = c2.parent_1 AND catalog.md5path_2 = c2.parent_2 "
-      "WHERE catalog.flags & "
-      + StringifyInt(catalog::SqlDirent::kFlagDirNestedMountpoint) + ";";
-    const bool init_successful = Init(database.sqlite_db(), statement);
-    assert(init_successful);
-  }
-};
-
 bool CommandMigrate::MigrationWorker_20x::RemoveDanglingNestedMountpoints(
   PendingCatalog *data) const
 {
@@ -1353,14 +1343,14 @@ bool CommandMigrate::MigrationWorker_20x::RemoveDanglingNestedMountpoints(
   const NestedCatalogList::const_iterator iend = nested_clgs.end();
   NestedCatalogMap nested_catalog_path_hashes;
   for (; i != iend; ++i) {
-    const PathString &path = i->path;
+    const PathString &path = i->mountpoint;
     const shash::Md5  hash(path.GetChars(), path.GetLength());
     nested_catalog_path_hashes[hash] = *i;
   }
 
   // Retrieve nested catalog mountpoints that have child entries directly inside
   // the current catalog (which is a malformed state)
-  SqlLookupDanglingMountpoints sql_dangling_mountpoints(writable);
+  catalog::SqlLookupDanglingMountpoints sql_dangling_mountpoints(writable);
   catalog::SqlDirentUpdate save_updated_mountpoint(writable);
 
   // go through the list of dangling nested catalog mountpoints and fix them
@@ -1376,9 +1366,9 @@ bool CommandMigrate::MigrationWorker_20x::RemoveDanglingNestedMountpoints(
     const NestedCatalogMap::const_iterator nested_catalog =
                                      nested_catalog_path_hashes.find(path_hash);
     if (nested_catalog != nested_catalog_path_hashes.end()) {
-      LogCvmfs(kLogCatalog, kLogStderr, "WARNING: found a non-empty nested "
-                                        "catalog mountpoint under '%s'",
-                                        nested_catalog->second.path.c_str());
+      LogCvmfs(kLogCatalog, kLogStderr,
+               "WARNING: found a non-empty nested catalog mountpoint under "
+               "'%s'", nested_catalog->second.mountpoint.c_str());
       continue;
     }
 
@@ -1467,15 +1457,15 @@ bool CommandMigrate::MigrationWorker_20x::GenerateCatalogStatistics(
 
   // Count various directory entry types in the catalog to fill up the catalog
   // statistics counters introduced in the current catalog schema
-  catalog::Sql count_regular_files(writable,
+  catalog::SqlCatalog count_regular_files(writable,
     "SELECT count(*) FROM catalog "
     "                WHERE  flags & :flag_file "
     "                       AND NOT flags & :flag_link;");
-  catalog::Sql count_symlinks(writable,
+  catalog::SqlCatalog count_symlinks(writable,
     "SELECT count(*) FROM catalog WHERE flags & :flag_link;");
-  catalog::Sql count_directories(writable,
+  catalog::SqlCatalog count_directories(writable,
     "SELECT count(*) FROM catalog WHERE flags & :flag_dir;");
-  catalog::Sql aggregate_file_size(writable,
+  catalog::SqlCatalog aggregate_file_size(writable,
     "SELECT sum(size) FROM catalog WHERE  flags & :flag_file "
     "                                     AND NOT flags & :flag_link");
 
@@ -1572,7 +1562,7 @@ bool CommandMigrate::MigrationWorker_20x::DetachOldCatalogDatabase(
 {
   assert(data->HasNew());
   const catalog::CatalogDatabase &writable = data->new_catalog->database();
-  catalog::Sql detach_old_catalog(writable, "DETACH old;");
+  catalog::SqlCatalog detach_old_catalog(writable, "DETACH old;");
   const bool retval = detach_old_catalog.Execute();
   if (!retval) {
     Error("Failed to detach old catalog database.", detach_old_catalog, data);
@@ -1651,12 +1641,12 @@ bool CommandMigrate::MigrationWorker_217::GenerateNewStatisticsCounters
 
   // Count various directory entry types in the catalog to fill up the catalog
   // statistics counters introduced in the current catalog schema
-  catalog::Sql count_chunked_files(writable,
+  catalog::SqlCatalog count_chunked_files(writable,
     "SELECT count(*), sum(size) FROM catalog "
     "                WHERE flags & :flag_chunked_file;");
-  catalog::Sql count_file_chunks(writable,
+  catalog::SqlCatalog count_file_chunks(writable,
     "SELECT count(*) FROM chunks;");
-  catalog::Sql aggregate_file_size(writable,
+  catalog::SqlCatalog aggregate_file_size(writable,
     "SELECT sum(size) FROM catalog WHERE  flags & :flag_file "
     "                                     AND NOT flags & :flag_link;");
 
@@ -1714,7 +1704,7 @@ bool CommandMigrate::MigrationWorker_217::UpdateCatalogSchema
   assert(!data->HasNew());
   const catalog::CatalogDatabase &writable =
     GetWritable(data->old_catalog)->database();
-  catalog::Sql update_schema_version(writable,
+  catalog::SqlCatalog update_schema_version(writable,
     "UPDATE properties SET value = :schema_version WHERE key = 'schema';");
 
   const bool retval =
@@ -1760,6 +1750,13 @@ bool CommandMigrate::ChownMigrationWorker::ApplyPersonaMappings(
   assert(data->old_catalog != NULL);
   assert(data->new_catalog == NULL);
 
+  if (data->old_catalog->mountpoint() ==
+      PathString("/" + string(catalog::VirtualCatalog::kVirtualPath)))
+  {
+    // skipping virtual catalog
+    return true;
+  }
+
   const catalog::CatalogDatabase &db =
                                      GetWritable(data->old_catalog)->database();
 
@@ -1767,13 +1764,13 @@ bool CommandMigrate::ChownMigrationWorker::ApplyPersonaMappings(
     return false;
   }
 
-  catalog::Sql uid_sql(db, uid_map_statement_);
+  catalog::SqlCatalog uid_sql(db, uid_map_statement_);
   if (!uid_sql.Execute()) {
     Error("Failed to update UIDs", uid_sql, data);
     return false;
   }
 
-  catalog::Sql gid_sql(db, gid_map_statement_);
+  catalog::SqlCatalog gid_sql(db, gid_map_statement_);
   if (!gid_sql.Execute()) {
     Error("Failed to update GIDs", gid_sql, data);
     return false;
@@ -1876,7 +1873,7 @@ bool CommandMigrate::HardlinkRemovalMigrationWorker::BreakUpHardlinks(
                            "SET hardlinks = 1 "
                            "WHERE flags & :file_flag "
                            "  AND hardlinks > 1;";
-  catalog::Sql hardlink_removal_sql(db, stmt);
+  catalog::SqlCatalog hardlink_removal_sql(db, stmt);
   hardlink_removal_sql.BindInt64(1, catalog::SqlDirent::kFlagFile);
   hardlink_removal_sql.Execute();
 

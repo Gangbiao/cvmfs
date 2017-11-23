@@ -20,11 +20,15 @@ SyncItem::SyncItem() :
   whiteout_(false),
   opaque_(false),
   masked_hardlink_(false),
+  has_catalog_marker_(false),
   valid_graft_(false),
   graft_marker_present_(false),
+  external_data_(false),
+  graft_chunklist_(NULL),
   graft_size_(-1),
   scratch_type_(static_cast<SyncItemType>(0)),
-  rdonly_type_(static_cast<SyncItemType>(0)) {}
+  rdonly_type_(static_cast<SyncItemType>(0)),
+  compression_algorithm_(zlib::kZlibDefault) {}
 
 SyncItem::SyncItem(const string       &relative_parent_path,
                    const string       &filename,
@@ -34,17 +38,25 @@ SyncItem::SyncItem(const string       &relative_parent_path,
   whiteout_(false),
   opaque_(false),
   masked_hardlink_(false),
+  has_catalog_marker_(false),
   valid_graft_(false),
   graft_marker_present_(false),
+  external_data_(false),
   relative_parent_path_(relative_parent_path),
   filename_(filename),
+  graft_chunklist_(NULL),
   graft_size_(-1),
   scratch_type_(entry_type),
-  rdonly_type_(kItemUnknown)
+  rdonly_type_(kItemUnknown),
+  compression_algorithm_(zlib::kZlibDefault)
 {
   content_hash_.algorithm = shash::kAny;
-  // Note: graft marker for non-regular files are silently ignored
-  if (IsRegularFile()) {CheckGraft();}
+  CheckMarkerFiles();
+}
+
+
+SyncItem::~SyncItem() {
+  delete graft_chunklist_;
 }
 
 
@@ -159,7 +171,6 @@ catalog::DirectoryEntryBase SyncItem::CreateBasicCatalogDirent() const {
 
   // inode and parent inode is determined at runtime of client
   dirent.inode_          = catalog::DirectoryEntry::kInvalidInode;
-  dirent.parent_inode_   = catalog::DirectoryEntry::kInvalidInode;
 
   // this might mask the actual link count in case hardlinks are not supported
   // (i.e. on setups using OverlayFS)
@@ -172,6 +183,8 @@ catalog::DirectoryEntryBase SyncItem::CreateBasicCatalogDirent() const {
                            this->GetUnionStat().st_size;
   dirent.mtime_          = this->GetUnionStat().st_mtime;
   dirent.checksum_       = this->GetContentHash();
+  dirent.is_external_file_ = this->IsExternalData();
+  dirent.compression_algorithm_ = this->GetCompressionAlgorithm();
 
   dirent.name_.Assign(filename_.data(), filename_.length());
 
@@ -204,6 +217,18 @@ std::string SyncItem::GetScratchPath() const {
   return union_engine_->scratch_path() + relative_path;
 }
 
+void SyncItem::CheckMarkerFiles() {
+  if (IsRegularFile()) {
+    CheckGraft();
+  } else if (IsDirectory()) {
+    CheckCatalogMarker();
+  }
+}
+
+void SyncItem::CheckCatalogMarker() {
+  has_catalog_marker_ = FileExists(GetUnionPath() + "/.cvmfscatalog");
+}
+
 
 std::string SyncItem::GetGraftMarkerPath() const {
   return union_engine_->scratch_path() + "/" +
@@ -223,7 +248,10 @@ void SyncItem::CheckGraft() {
            graftfile.c_str());
   FILE *fp = fopen(graftfile.c_str(), "r");
   if (fp == NULL) {
-    if (errno != ENOENT) {
+    // This sync item can be a file from a removed directory tree on overlayfs.
+    // In this case, the entire tree is missing on the scratch directory and
+    // the errno is ENOTDIR.
+    if ((errno != ENOENT) && (errno != ENOTDIR)) {
       LogCvmfs(kLogFsTraversal, kLogWarning, "Unable to open graft file "
                "(%s): %s (errno=%d)",
                graftfile.c_str(), strerror(errno), errno);
@@ -231,8 +259,13 @@ void SyncItem::CheckGraft() {
     return;
   }
   graft_marker_present_ = true;
+  valid_graft_ = true;
   std::string line;
   std::vector<std::string> contents;
+
+  std::vector<off_t> chunk_offsets;
+  std::vector<shash::Any> chunk_checksums;
+
   while (GetLineFile(fp, &line)) {
     std::string trimmed_line = Trim(line);
 
@@ -267,6 +300,35 @@ void SyncItem::CheckGraft() {
                  info[1].c_str());
       }
       continue;
+    } else if (info[0] == "chunk_offsets") {
+      std::vector<std::string> offsets = SplitString(info[1], ',');
+      for (std::vector<std::string>::const_iterator it = offsets.begin();
+           it != offsets.end(); it++)
+      {
+        uint64_t val;
+        if (!String2Uint64Parse(*it, &val)) {
+          valid_graft_ = false;
+          LogCvmfs(kLogFsTraversal, kLogWarning, "Invalid chunk offset: %s.",
+                   it->c_str());
+          break;
+        }
+        chunk_offsets.push_back(val);
+      }
+    } else if (info[0] == "chunk_checksums") {
+      std::vector<std::string> csums = SplitString(info[1], ',');
+      for (std::vector<std::string>::const_iterator it = csums.begin();
+           it != csums.end(); it++)
+      {
+        shash::HexPtr hashP(*it);
+        if (hashP.IsValid()) {
+          chunk_checksums.push_back(shash::MkFromHexPtr(hashP));
+        } else {
+          LogCvmfs(kLogFsTraversal, kLogWarning, "Invalid chunk checksum "
+                 "value: %s.", it->c_str());
+          valid_graft_ = false;
+          break;
+        }
+      }
     }
   }
   if (!feof(fp)) {
@@ -275,9 +337,44 @@ void SyncItem::CheckGraft() {
              graftfile.c_str(), strerror(errno), errno);
   }
   fclose(fp);
-  valid_graft_ = (graft_size_ > -1) && found_checksum;
-  return;
-}
+  valid_graft_ = valid_graft_ && (graft_size_ > -1) && found_checksum
+                 && (chunk_checksums.size() == chunk_offsets.size());
 
+  if (!valid_graft_ || chunk_offsets.empty())
+    return;
+
+  // Parse chunks
+  graft_chunklist_ = new FileChunkList(chunk_offsets.size());
+  off_t last_offset = chunk_offsets[0];
+  if (last_offset != 0) {
+    LogCvmfs(kLogFsTraversal, kLogWarning, "First chunk offset must be 0"
+             " (in graft marker %s).", graftfile.c_str());
+    valid_graft_ = false;
+  }
+  for (unsigned idx = 1; idx < chunk_offsets.size(); idx++) {
+    off_t cur_offset = chunk_offsets[idx];
+    if (last_offset >= cur_offset) {
+      LogCvmfs(kLogFsTraversal, kLogWarning, "Chunk offsets must be sorted "
+               "in strictly increasing order (in graft marker %s).",
+               graftfile.c_str());
+      valid_graft_ = false;
+      break;
+    }
+    size_t cur_size = cur_offset - last_offset;
+    graft_chunklist_->PushBack(FileChunk(chunk_checksums[idx - 1],
+                                         last_offset,
+                                         cur_size));
+    last_offset = cur_offset;
+  }
+  if (graft_size_ <= last_offset) {
+    LogCvmfs(kLogFsTraversal, kLogWarning, "Last offset must be strictly "
+             "less than total file size (in graft marker %s).",
+             graftfile.c_str());
+    valid_graft_ = false;
+  }
+  graft_chunklist_->PushBack(FileChunk(chunk_checksums.back(),
+                                        last_offset,
+                                        graft_size_ - last_offset));
+}
 
 }  // namespace publish

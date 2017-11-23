@@ -37,10 +37,11 @@ class CommandTag : public Command {
   static const std::string kPreviousHeadTag;
   static const std::string kPreviousHeadTagDescription;
 
+  CommandTag() { }
+
  protected:
   typedef std::vector<history::History::Tag> TagList;
 
- protected:
   struct Environment {
     Environment(const std::string &repository_url,
                 const std::string &tmp_path) :
@@ -57,11 +58,6 @@ class CommandTag : public Command {
     UnlinkGuard                    history_path;
   };
 
- public:
-  CommandTag() { }
-
- protected:
-  void InsertCommonParameters(ParameterList *parameters);
 
   Environment* InitializeEnvironment(const ArgumentList &args,
                                      const bool read_write);
@@ -75,11 +71,7 @@ class CommandTag : public Command {
                       const history::History::Tag  &current_head_template,
                       const bool                    undo_rollback = false);
 
-  manifest::Manifest* FetchManifest(const std::string  &repository_url,
-                                    const std::string  &repository_name,
-                                    const std::string  &pubkey_path,
-                                    const std::string  &trusted_certs,
-                                    const shash::Any   &base_hash) const;
+  // TODO(jblomer): replace by swissknife::Assistant
   bool FetchObject(const std::string    &repository_url,
                    const shash::Any     &object_hash,
                    const std::string    &destination_path) const;
@@ -107,17 +99,24 @@ class CommandTag : public Command {
 //------------------------------------------------------------------------------
 
 
-class CommandCreateTag : public CommandTag {
+/**
+ * If -a and -d are specified, removal of tags takes place before the new tag is
+ * added.
+ */
+class CommandEditTag : public CommandTag {
  public:
-  std::string GetName() { return "tag_create"; }
-  std::string GetDescription() {
-    return "Create a tag for a specific snapshot.";
+  virtual std::string GetName() const { return "tag_edit"; }
+  virtual std::string GetDescription() const {
+    return "Create a tag and/or remove tags.";
   }
 
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
   int Main(const ArgumentList &args);
 
  protected:
+  int RemoveTags(const ArgumentList &args, Environment *env);
+  int AddNewTag(const ArgumentList &args, Environment *env);
+
   shash::Any GetTagRootHash(Environment *env,
                             const std::string &root_hash_string) const;
   bool ManipulateTag(Environment                  *env,
@@ -133,29 +132,14 @@ class CommandCreateTag : public CommandTag {
 //------------------------------------------------------------------------------
 
 
-class CommandRemoveTag : public CommandTag {
- public:
-  std::string GetName() { return "tag_remove"; }
-  std::string GetDescription() {
-    return "Remove one or more tags.";
-  }
-
-  ParameterList GetParams();
-  int Main(const ArgumentList &args);
-};
-
-
-//------------------------------------------------------------------------------
-
-
 class CommandListTags : public CommandTag {
  public:
-  std::string GetName() { return "tag_list"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "tag_list"; }
+  virtual std::string GetDescription() const {
     return "List tags in the tag database.";
   }
 
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
   int Main(const ArgumentList &args);
 
  protected:
@@ -169,12 +153,12 @@ class CommandListTags : public CommandTag {
 
 class CommandInfoTag : public CommandTag {
  public:
-  std::string GetName() { return "tag_info"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "tag_info"; }
+  virtual std::string GetDescription() const {
     return "Obtain detailed information about a tag.";
   }
 
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
   int Main(const ArgumentList &args);
 
  protected:
@@ -188,12 +172,12 @@ class CommandInfoTag : public CommandTag {
 
 class CommandRollbackTag : public CommandTag {
  public:
-  std::string GetName() { return "tag_rollback"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "tag_rollback"; }
+  virtual std::string GetDescription() const {
     return "Rollback repository to a given tag.";
   }
 
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
   int Main(const ArgumentList &args);
 
  protected:
@@ -206,12 +190,12 @@ class CommandRollbackTag : public CommandTag {
 
 class CommandEmptyRecycleBin : public CommandTag {
  public:
-  std::string GetName() { return "tag_empty_bin"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "tag_empty_bin"; }
+  virtual std::string GetDescription() const {
     return "Empty the internal recycle bin of the history database.";
   }
 
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
   int Main(const ArgumentList &args);
 };
 

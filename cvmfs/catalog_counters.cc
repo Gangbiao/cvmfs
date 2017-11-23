@@ -16,6 +16,10 @@ void DeltaCounters::ApplyDelta(const DirectoryEntry &dirent, const int delta) {
       self.chunked_files     += delta;
       self.chunked_file_size += delta * dirent.size();
     }
+    if (dirent.IsExternalFile()) {
+      self.externals += delta;
+      self.external_file_size += delta * dirent.size();
+    }
   } else if (dirent.IsLink()) {
     self.symlinks += delta;
   } else if (dirent.IsDirectory()) {
@@ -65,6 +69,16 @@ Counters_t Counters::GetSubtreeEntries() const {
 
 Counters_t Counters::GetAllEntries() const {
   return GetSelfEntries() + GetSubtreeEntries();
+}
+
+
+DeltaCounters Counters::Diff(const Counters &from, const Counters &to) {
+  DeltaCounters result;
+  result.self.Add(to.self);
+  result.subtree.Add(to.subtree);
+  result.self.Subtract(from.self);
+  result.subtree.Subtract(from.subtree);
+  return result;
 }
 
 }  // namespace catalog

@@ -2,4 +2,6 @@
 
 make clean
 make
-strip -S lib/.libs/libcurl.a
+# Don't strip debug dymbols
+# strip -S lib/.libs/libcurl.a
+make install

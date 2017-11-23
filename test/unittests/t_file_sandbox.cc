@@ -4,12 +4,13 @@
 
 #include <gtest/gtest.h>
 
+#include <errno.h>
+
 #include <string>
 
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/prng.h"
-#include "../../cvmfs/util.h"
 #include "c_file_sandbox.h"
+#include "hash.h"
+#include "prng.h"
 
 
 class T_FileSandbox : public FileSandbox {
@@ -99,6 +100,16 @@ TEST_F(T_FileSandbox, SmallFile) {
 }
 
 
+TEST_F(T_FileSandbox, SmallZeroFile) {
+  const std::string small_zero_file = GetSmallZeroFile();
+
+  EXPECT_EQ(50 * 1024, GetFileSize(small_zero_file));
+
+  shash::Any sha = HashFile(small_zero_file);
+  EXPECT_EQ("7188972f71aee4c62669330ff7776e48094b4d9d", sha.ToString());
+}
+
+
 TEST_F(T_FileSandbox, BigFile) {
   const std::string big_file = GetBigFile();
   const int64_t file_size = GetFileSize(big_file);
@@ -110,6 +121,16 @@ TEST_F(T_FileSandbox, BigFile) {
 }
 
 
+TEST_F(T_FileSandbox, BigZeroFile) {
+  const std::string big_zero_file = GetBigZeroFile();
+
+  EXPECT_EQ(4 * 1024 * 1024, GetFileSize(big_zero_file));
+
+  shash::Any sha = HashFile(big_zero_file);
+  EXPECT_EQ("2bccbd2f38f15c13eb7d5a89fd9d85f595e23bc3", sha.ToString());
+}
+
+
 TEST_F(T_FileSandbox, HugeFileSlow) {
   const std::string huge_file = GetHugeFile();
   const int64_t file_size = GetFileSize(huge_file);
@@ -118,4 +139,14 @@ TEST_F(T_FileSandbox, HugeFileSlow) {
 
   shash::Any sha = HashFile(huge_file);
   EXPECT_EQ("e09bdb4354db2ac46309130ee91ad7c4131f29ea", sha.ToString());
+}
+
+
+TEST_F(T_FileSandbox, HugeZeroFileSlow) {
+  const std::string huge_zero_file = GetHugeZeroFile();
+
+  EXPECT_EQ(100 * 1024 * 1024, GetFileSize(huge_zero_file));
+
+  shash::Any sha = HashFile(huge_zero_file);
+  EXPECT_EQ("2c2ceccb5ec5574f791d45b63c940cff20550f9a", sha.ToString());
 }

@@ -14,6 +14,7 @@
 #include "cvmfs_config.h"
 #include "signature.h"
 
+#include <openssl/evp.h>
 #include <openssl/pkcs7.h>
 #include <openssl/x509v3.h>
 
@@ -26,11 +27,13 @@
 #include <vector>
 
 #include "compression.h"
+#include "duplex_ssl.h"
 #include "hash.h"
 #include "logging.h"
 #include "platform.h"
 #include "smalloc.h"
-#include "util.h"
+#include "util/string.h"
+#include "util_concurrency.h"
 
 using namespace std;  // NOLINT
 
@@ -66,6 +69,8 @@ SignatureManager::SignatureManager() {
   certificate_ = NULL;
   x509_store_ = NULL;
   x509_lookup_ = NULL;
+  int retval = pthread_mutex_init(&lock_blacklist_, NULL);
+  assert(retval == 0);
 }
 
 
@@ -78,7 +83,7 @@ void SignatureManager::InitX509Store() {
   unsigned long verify_flags =  // NOLINT(runtime/int)
     X509_V_FLAG_CRL_CHECK |
     X509_V_FLAG_CRL_CHECK_ALL;
-#if OPENSSL_VERSION_NUMBER < 0x00908000L
+#ifdef OPENSSL_API_INTERFACE_V09
   X509_STORE_set_flags(x509_store_, verify_flags);
 #else
   int retval;
@@ -290,11 +295,53 @@ bool SignatureManager::LoadPublicRsaKeys(const string &path_list) {
 }
 
 
+std::string SignatureManager::GenerateKeyText(RSA *pubkey) {
+  if (!pubkey) {return "";}
+
+  BIO *bp = BIO_new(BIO_s_mem());
+  if (bp == NULL) {
+    LogCvmfs(kLogSignature, kLogDebug | kLogSyslogErr, "Failed to allocate"
+             " memory for pubkey");
+    return "";
+  }
+  if (!PEM_write_bio_RSA_PUBKEY(bp, pubkey)) {
+    LogCvmfs(kLogSignature, kLogDebug | kLogSyslogErr, "Failed to write"
+             " pubkey to memory");
+    return "";
+  }
+  char *bio_pubkey_text;
+  long bytes = BIO_get_mem_data(bp, &bio_pubkey_text);  // NOLINT
+  std::string bio_pubkey_str(bio_pubkey_text, bytes);
+  BIO_free(bp);
+
+  return bio_pubkey_str;
+}
+
+
+std::string SignatureManager::GetActivePubkeys() {
+  std::string pubkeys;
+  for (std::vector<RSA *>::const_iterator it = public_keys_.begin();
+       it != public_keys_.end();
+       it++) {
+    pubkeys += GenerateKeyText(*it);
+  }
+  // NOTE: we do not add the pubkey of the certificate here, as it is
+  // not used for the whitelist verification.
+  return pubkeys;
+}
+
 /**
  * Loads a list of blacklisted certificates (fingerprints) from a file.
  */
-bool SignatureManager::LoadBlacklist(const std::string &path_blacklist) {
-  blacklisted_certificates_.clear();
+bool SignatureManager::LoadBlacklist(
+  const std::string &path_blacklist,
+  bool append)
+{
+  MutexLockGuard lock_guard(&lock_blacklist_);
+  LogCvmfs(kLogSignature, kLogDebug, "reading from blacklist %s",
+           path_blacklist.c_str());
+  if (!append)
+    blacklist_.clear();
 
   char *buffer;
   unsigned buffer_size;
@@ -306,10 +353,10 @@ bool SignatureManager::LoadBlacklist(const std::string &path_blacklist) {
 
   unsigned num_bytes = 0;
   while (num_bytes < buffer_size) {
-    const string fingerprint = GetLineMem(buffer + num_bytes,
-                                          buffer_size - num_bytes);
-    blacklisted_certificates_.push_back(fingerprint);
-    num_bytes += fingerprint.length() + 1;
+    const string line = GetLineMem(buffer + num_bytes,
+                                   buffer_size - num_bytes);
+    blacklist_.push_back(line);
+    num_bytes += line.length() + 1;
   }
   free(buffer);
 
@@ -317,8 +364,9 @@ bool SignatureManager::LoadBlacklist(const std::string &path_blacklist) {
 }
 
 
-vector<string> SignatureManager::GetBlacklistedCertificates() {
-  return blacklisted_certificates_;
+vector<string> SignatureManager::GetBlacklist() {
+  MutexLockGuard lock_guard(&lock_blacklist_);
+  return blacklist_;
 }
 
 
@@ -519,18 +567,27 @@ bool SignatureManager::Sign(const unsigned char *buffer,
   }
 
   bool result = false;
+#ifdef OPENSSL_API_INTERFACE_V11
+  EVP_MD_CTX *ctx_ptr = EVP_MD_CTX_new();
+#else
   EVP_MD_CTX ctx;
+  EVP_MD_CTX_init(&ctx);
+  EVP_MD_CTX *ctx_ptr = &ctx;
+#endif
 
   *signature = reinterpret_cast<unsigned char *>(
                  smalloc(EVP_PKEY_size(private_key_)));
-  EVP_MD_CTX_init(&ctx);
-  if (EVP_SignInit(&ctx, EVP_sha1()) &&
-      EVP_SignUpdate(&ctx, buffer, buffer_size) &&
-      EVP_SignFinal(&ctx, *signature, signature_size, private_key_))
+  if (EVP_SignInit(ctx_ptr, EVP_sha1()) &&
+      EVP_SignUpdate(ctx_ptr, buffer, buffer_size) &&
+      EVP_SignFinal(ctx_ptr, *signature, signature_size, private_key_))
   {
     result = true;
   }
+#ifdef OPENSSL_API_INTERFACE_V11
+  EVP_MD_CTX_free(ctx_ptr);
+#else
   EVP_MD_CTX_cleanup(&ctx);
+#endif
   if (!result) {
     free(*signature);
     *signature_size = 0;
@@ -554,24 +611,35 @@ bool SignatureManager::Verify(const unsigned char *buffer,
   if (!certificate_) return false;
 
   bool result = false;
-  EVP_MD_CTX ctx;
-
-  EVP_MD_CTX_init(&ctx);
-  if (EVP_VerifyInit(&ctx, EVP_sha1()) &&
-      EVP_VerifyUpdate(&ctx, buffer, buffer_size) &&
-#if OPENSSL_VERSION_NUMBER < 0x00908000L
-      EVP_VerifyFinal(&ctx,
-                      const_cast<unsigned char *>(signature), signature_size,
-                      X509_get_pubkey(certificate_))
+#ifdef OPENSSL_API_INTERFACE_V11
+  EVP_MD_CTX *ctx_ptr = EVP_MD_CTX_new();
 #else
-      EVP_VerifyFinal(&ctx, signature, signature_size,
-                      X509_get_pubkey(certificate_))
+  EVP_MD_CTX ctx;
+  EVP_MD_CTX_init(&ctx);
+  EVP_MD_CTX *ctx_ptr = &ctx;
+#endif
+
+  EVP_PKEY *pubkey = X509_get_pubkey(certificate_);
+  if (EVP_VerifyInit(ctx_ptr, EVP_sha1()) &&
+      EVP_VerifyUpdate(ctx_ptr, buffer, buffer_size) &&
+#ifdef OPENSSL_API_INTERFACE_V09
+      EVP_VerifyFinal(ctx_ptr,
+                      const_cast<unsigned char *>(signature), signature_size,
+                      pubkey)
+#else
+      EVP_VerifyFinal(ctx_ptr, signature, signature_size, pubkey)
 #endif
     )
   {
     result = true;
   }
+  if (pubkey != NULL)
+    EVP_PKEY_free(pubkey);
+#ifdef OPENSSL_API_INTERFACE_V11
+  EVP_MD_CTX_free(ctx_ptr);
+#else
   EVP_MD_CTX_cleanup(&ctx);
+#endif
 
   return result;
 }
@@ -765,8 +833,12 @@ bool SignatureManager::VerifyPkcs7(const unsigned char *buffer,
         if (this_name->type != GEN_URI)
           continue;
 
-        char *name_ptr = reinterpret_cast<char *>(
+        const char *name_ptr = reinterpret_cast<const char *>(
+#ifdef OPENSSL_API_INTERFACE_V11
+          ASN1_STRING_get0_data(this_name->d.uniformResourceIdentifier));
+#else
           ASN1_STRING_data(this_name->d.uniformResourceIdentifier));
+#endif
         int name_len =
           ASN1_STRING_length(this_name->d.uniformResourceIdentifier);
         if (!name_ptr || (name_len <= 0))

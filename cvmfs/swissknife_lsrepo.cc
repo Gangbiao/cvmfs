@@ -5,7 +5,11 @@
 #include "cvmfs_config.h"
 #include "swissknife_lsrepo.h"
 
+#include <string>
+
 #include "logging.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 namespace swissknife {
 
@@ -14,13 +18,14 @@ CommandListCatalogs::CommandListCatalogs() :
   print_entries_(false) {}
 
 
-ParameterList CommandListCatalogs::GetParams() {
+ParameterList CommandListCatalogs::GetParams() const {
   ParameterList r;
   r.push_back(Parameter::Mandatory(
               'r', "repository URL (absolute local path or remote URL)"));
   r.push_back(Parameter::Optional('n', "fully qualified repository name"));
-  r.push_back(Parameter::Optional('k', "repository master key(s)"));
+  r.push_back(Parameter::Optional('k', "repository master key(s) / dir"));
   r.push_back(Parameter::Optional('l', "temporary directory"));
+  r.push_back(Parameter::Optional('h', "root hash (other than trunk)"));
   r.push_back(Parameter::Switch('t', "print tree structure of catalogs"));
   r.push_back(Parameter::Switch('d', "print digest for each catalog"));
   r.push_back(Parameter::Switch('s', "print catalog file sizes"));
@@ -35,22 +40,27 @@ int CommandListCatalogs::Main(const ArgumentList &args) {
   print_size_    = (args.count('s') > 0);
   print_entries_ = (args.count('e') > 0);
 
+  shash::Any manual_root_hash;
   const std::string &repo_url  = *args.find('r')->second;
   const std::string &repo_name =
     (args.count('n') > 0) ? *args.find('n')->second : "";
-  const std::string &repo_keys =
+  std::string repo_keys =
     (args.count('k') > 0) ? *args.find('k')->second : "";
+  if (DirectoryExists(repo_keys))
+    repo_keys = JoinStrings(FindFiles(repo_keys, ".pub"), ":");
   const std::string &tmp_dir   =
     (args.count('l') > 0) ? *args.find('l')->second : "/tmp";
+  if (args.count('h') > 0) {
+    manual_root_hash = shash::MkFromHexPtr(shash::HexPtr(
+      *args.find('h')->second), shash::kSuffixCatalog);
+  }
 
   bool success = false;
   if (IsHttpUrl(repo_url)) {
-    download::DownloadManager   download_manager;
-    signature::SignatureManager signature_manager;
-    download_manager.Init(1, true, g_statistics);
-    signature_manager.Init();
-    if (!signature_manager.LoadPublicRsaKeys(repo_keys)) {
-      LogCvmfs(kLogCatalog, kLogStderr, "Failed to load public key(s)");
+    const bool follow_redirects = false;
+    if (!this->InitDownloadManager(follow_redirects) ||
+        !this->InitVerifyingSignatureManager(repo_keys)) {
+      LogCvmfs(kLogCatalog, kLogStderr, "Failed to init remote connection");
       return 1;
     }
 
@@ -58,15 +68,12 @@ int CommandListCatalogs::Main(const ArgumentList &args) {
                       history::SqliteHistory> fetcher(repo_name,
                                                       repo_url,
                                                       tmp_dir,
-                                                      &download_manager,
-                                                      &signature_manager);
-    success = Run(&fetcher);
-
-    download_manager.Fini();
-    signature_manager.Fini();
+                                                      download_manager(),
+                                                      signature_manager());
+    success = Run(manual_root_hash, &fetcher);
   } else {
     LocalObjectFetcher<> fetcher(repo_url, tmp_dir);
-    success = Run(&fetcher);
+    success = Run(manual_root_hash, &fetcher);
   }
 
   return (success) ? 0 : 1;
@@ -102,7 +109,7 @@ void CommandListCatalogs::CatalogCallback(
     clg_entries = StringifyInt(data.catalog->GetNumEntries()) + " ";
   }
 
-  path = data.catalog->path().ToString();
+  path = data.catalog->mountpoint().ToString();
   if (path.empty())
     path = "/";
 

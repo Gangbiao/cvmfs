@@ -35,6 +35,7 @@
 #include <set>
 #include <string>
 
+#include "path_filters/dirtab.h"
 #include "sync_item.h"
 
 namespace publish {
@@ -120,12 +121,13 @@ class SyncUnion {
   /**
    * Union file systems may use some special files for bookkeeping.
    * They must not show up in to repository and are ignored by the recursion.
+   * Note: This needs to be up-called!
    * @param parent directory in which file resides
    * @param filename to decide whether to ignore or not
    * @return true if file should be ignored, othewise false
    */
   virtual bool IgnoreFilePredicate(const std::string &parent_dir,
-                                   const std::string &filename) = 0;
+                                   const std::string &filename);
 
   bool IsInitialized() const { return initialized_; }
   virtual bool SupportsHardlinks() const { return false; }
@@ -189,6 +191,21 @@ class SyncUnion {
   virtual void LeaveDirectory(const std::string &parent_dir,
                               const std::string &dir_name);
 
+  /**
+   *Callback when a character device is found
+   * @param parent_dir the relative directory path
+   * @param filename the filename
+   */
+  void ProcessCharacterDevice(const std::string &parent_dir,
+                              const std::string &filename);
+
+  /**
+   *Callback when a block device is found
+   * @param parent_dir the relative directory path
+   * @param filename the filename
+   */
+  void ProcessBlockDevice(const std::string &parent_dir,
+                          const std::string &filename);
 
   /**
    * Called to actually process the file entry.
@@ -253,10 +270,6 @@ class SyncUnionOverlayfs : public SyncUnion {
   bool IsOpaqueDirectory(const SyncItem &directory) const;
   bool IsWhiteoutSymlinkPath(const std::string &path) const;
 
-  bool IgnoreFilePredicate(const std::string &parent_dir,
-                           const std::string &filename);
-  void ProcessCharacterDevice(const std::string &parent_dir,
-                              const std::string &filename);
   std::string UnwindWhiteoutFilename(const SyncItem &entry) const;
   std::set<std::string> GetIgnoreFilenames() const;
 

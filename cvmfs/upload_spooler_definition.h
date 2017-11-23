@@ -7,6 +7,7 @@
 
 #include <string>
 
+#include "compression.h"
 #include "hash.h"
 
 namespace upload {
@@ -19,12 +20,8 @@ namespace upload {
  *      to define a local spooler with upstream path /srv/cvmfs/dev.cern.ch
  */
 struct SpoolerDefinition {
-  enum DriverType {
-    S3,
-    Local,
-    Mock,
-    Unknown
-  };
+  static const unsigned kDefaultMaxConcurrentUploads = 512;
+  enum DriverType { S3, Local, Gateway, Mock, Unknown };
 
   /**
    * Reads a given definition_string as described above and interprets
@@ -35,31 +32,53 @@ struct SpoolerDefinition {
    * @param definition_string   the spooler definition string to be inter-
    *                            preted by the constructor
    */
-  explicit SpoolerDefinition(
-    const std::string       &definition_string,
-    const shash::Algorithms  hash_algorithm,
-    const bool               use_file_chunking   = false,
-    const size_t             min_file_chunk_size = 0,
-    const size_t             avg_file_chunk_size = 0,
-    const size_t             max_file_chunk_size = 0);
+  SpoolerDefinition(
+      const std::string& definition_string,
+      const shash::Algorithms hash_algorithm,
+      const zlib::Algorithms compression_algorithm = zlib::kZlibDefault,
+      const bool generate_legacy_bulk_chunks = false,
+      const bool use_file_chunking = false,
+      const size_t min_file_chunk_size = 0,
+      const size_t avg_file_chunk_size = 0,
+      const size_t max_file_chunk_size = 0,
+      const std::string& session_token_file = "",
+      const std::string& key_file = "");
+
   bool IsValid() const { return valid_; }
 
-  DriverType  driver_type;            //!< the type of the spooler driver
-  std::string temporary_path;         //!< scratch space for the FileProcessor
   /**
-   * A driver specific spooler configuration string (interpreted by the concrete
-   * spooler)
+   * Creates a new SpoolerDefinition based on an existing one.  The new spooler
+   * has compression set to zlib, which is required for catalogs and other meta-
+   * objects.
    */
+  SpoolerDefinition Dup2DefaultCompression() const;
+
+  DriverType driver_type;      //!< the type of the spooler driver
+  std::string temporary_path;  //!< scratch space for the IngestionPipeline
+
+  /**
+  * A driver specific spooler configuration string (interpreted by the concrete
+  * spooler)
+  */
   std::string spooler_configuration;
 
-  shash::Algorithms  hash_algorithm;
-  bool               use_file_chunking;
-  size_t             min_file_chunk_size;
-  size_t             avg_file_chunk_size;
-  size_t             max_file_chunk_size;
+  shash::Algorithms hash_algorithm;
+  zlib::Algorithms compression_alg;
+  /**
+   * If a file is chunked, clients >= 2.1.7 do not need the bulk chunk.  We can
+   * force creating the bulk chunks for backwards compatibility.
+   */
+  bool generate_legacy_bulk_chunks;
+  bool use_file_chunking;
+  size_t min_file_chunk_size;
+  size_t avg_file_chunk_size;
+  size_t max_file_chunk_size;
 
-  const unsigned int number_of_threads;
-  unsigned int       number_of_concurrent_uploads;
+  unsigned int number_of_concurrent_uploads;
+
+  // The session_token_file parameter is only used for the HTTP driver
+  std::string session_token_file;
+  std::string key_file;
 
   bool valid_;
 };

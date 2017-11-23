@@ -1,5 +1,36 @@
+cvmfs-config-default (1.6-1) lucid; urgency=low
+
+  * Turn into virtual package
+
+ -- Dave Dykstra <dwd@fnal.gov>  Tue, 14 Nov 2017 16:00:00 +0000
+
+cvmfs-config-default (1.5-1) lucid; urgency=low
+
+  * Update comment on config repository
+
+ -- Jakob Blomer <jblomer@cern.ch>  Thu, 29 Jun 2017 10:00:00 +0000
+
+cvmfs-config-default (1.4-1) lucid; urgency=low
+
+  * Remove dedicated atlas-nightlies.cern.ch Stratum 1
+
+ -- Jakob Blomer <jblomer@cern.ch>  Thu, 11 May 2017 12:00:00 +0000
+
+cvmfs-config-default (1.3-1) lucid; urgency=low
+
+  * Update cern.ch master keys
+  * Disable ASGC Stratum 1
+
+ -- Jakob Blomer <jblomer@cern.ch>  Wed, 18 Jan 2017 11:48:00 +0000
+
+cvmfs-config-default (1.1-2) lucid; urgency=low
+
+  * Fix packaging errors
+
+ -- Jakob Blomer <jblomer@cern.ch>  Thu, 12 Sep 2016 12:00:00 +0000
+
 cvmfs-config-default (1.1-1) lucid; urgency=low
 
   * Initial packaging
-  
+
  -- Jakob Blomer <jblomer@cern.ch>  Thu, 22 Jan 2015 12:00:00 +0000

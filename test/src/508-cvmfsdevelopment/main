@@ -4,10 +4,10 @@ cvmfs_test_autofs_on_startup=false
 
 # cvmfs source tarballs to be downloaded and used as test data
 # TODO: replace this by upcoming CVMFS versions...
-cvmfs_versions="http://ecsft.cern.ch/dist/cvmfs/cvmfs-2.1.11/cvmfs-2.1.11.tar.gz
-http://ecsft.cern.ch/dist/cvmfs/cvmfs-2.1.12/cvmfs-2.1.12.tar.gz
-http://ecsft.cern.ch/dist/cvmfs/cvmfs-2.1.14/cvmfs-2.1.14.tar.gz
-http://ecsft.cern.ch/dist/cvmfs/cvmfs-2.1.15/cvmfs-2.1.15.tar.gz"
+cvmfs_versions="http://ecsft.cern.ch/dist/cvmfs/archive/cvmfs-2.1.11/cvmfs-2.1.11.tar.gz
+http://ecsft.cern.ch/dist/cvmfs/archive/cvmfs-2.1.12/cvmfs-2.1.12.tar.gz
+http://ecsft.cern.ch/dist/cvmfs/archive/cvmfs-2.1.14/cvmfs-2.1.14.tar.gz
+http://ecsft.cern.ch/dist/cvmfs/archive/cvmfs-2.1.15/cvmfs-2.1.15.tar.gz"
 
 
 # retrieve the URL at a given index (dash workaround)
@@ -198,6 +198,9 @@ cvmfs_run_test() {
   local scratch_dir=$(pwd)
   mkdir reference_dir
   local reference_dir=$scratch_dir/reference_dir
+
+  echo -n "checking for wget... "
+  which wget > /dev/null 2>&1 && echo "done" || { echo "not found"; return 1; }
 
   echo "create a fresh repository named $CVMFS_TEST_REPO with user $CVMFS_TEST_USER"
   create_empty_repo $CVMFS_TEST_REPO $CVMFS_TEST_USER || return $?

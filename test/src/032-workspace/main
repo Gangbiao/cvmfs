@@ -1,0 +1,47 @@
+
+cvmfs_test_name="CVMFS_WORKSPACE"
+
+cvmfs_run_test() {
+  logfile=$1
+
+  local cache_dir=$(get_cvmfs_cachedir grid.cern.ch)
+  local workspace="$(dirname $cache_dir)/workspace"
+  echo "*** cache directory is $cache_dir"
+  echo "*** workspace is $workspace"
+
+  echo "*** cleaning up existing mount points"
+  cvmfs_clean || return 2
+
+  echo "*** mount with dedicated workspace"
+  cvmfs_mount grid.cern.ch "CVMFS_WORKSPACE=$workspace" || return 3
+  cat /cvmfs/grid.cern.ch/README || return 4
+
+  local pid_talk=$(sudo cvmfs_talk -i grid.cern.ch pid)
+  local pid_attr=$(get_xattr pid /cvmfs/grid.cern.ch)
+  if [ "x$pid_talk" != "x$pid_attr" ]; then
+    echo "Error: pid from cvmfs_talk is '$pid_talk'"
+    echo "pid from attributes is '$pid_attr'"
+    return 10
+  fi
+  sudo cvmfs_talk -i grid.cern.ch cache list || return 11
+
+  local num_lock_files=$(sudo find $cache_dir -name 'lock*' | wc -l)
+  local num_pipe_files=$(sudo find $cache_dir -name 'pipe*' | wc -l)
+  if [ $num_lock_files -ne 0 ]; then
+    echo "found control files in $cache_dir which should be in $workspace"
+    sudo ls $cache_dir
+    return 20
+  fi
+  if [ $num_pipe_files -ne 0 ]; then
+    sudo ls $cache_dir
+    return 21
+  fi
+  num_lock_files=$(sudo find $workspace -name 'lock*' | wc -l)
+  if [ $num_lock_files -eq 0 ]; then
+    sudo ls $workspace
+    return 22
+  fi
+
+  return 0
+}
+

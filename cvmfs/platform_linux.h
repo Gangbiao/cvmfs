@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,7 @@
 namespace CVMFS_NAMESPACE_GUARD {
 #endif
 
+#define platform_sighandler_t sighandler_t
 
 inline std::vector<std::string> platform_mountlist() {
   std::vector<std::string> result;
@@ -50,12 +52,11 @@ inline std::vector<std::string> platform_mountlist() {
   return result;
 }
 
-
 // glibc < 2.11
 #ifndef MNT_DETACH
 #define MNT_DETACH 0x00000002
 #endif
-inline bool platform_umount(const char* mountpoint, const bool lazy) {
+inline bool platform_umount(const char *mountpoint, const bool lazy) {
   struct stat64 mtab_info;
   int retval = lstat64(_PATH_MOUNTED, &mtab_info);
   // If /etc/mtab exists and is not a symlink to /proc/mount
@@ -64,8 +65,7 @@ inline bool platform_umount(const char* mountpoint, const bool lazy) {
     // crash unmount handlers
     std::string lockfile = std::string(_PATH_MOUNTED) + ".cvmfslock";
     const int fd_lockfile = open(lockfile.c_str(), O_RDONLY | O_CREAT, 0600);
-    if (fd_lockfile < 0)
-      return false;
+    if (fd_lockfile < 0) return false;
     int timeout = 10;
     while ((flock(fd_lockfile, LOCK_EX | LOCK_NB) != 0) && (timeout > 0)) {
       if (errno != EWOULDBLOCK) {
@@ -89,10 +89,8 @@ inline bool platform_umount(const char* mountpoint, const bool lazy) {
       return false;
     }
     FILE *fmntnew = setmntent(mntnew.c_str(), "w+");
-    if (!fmntnew &&
-        (chmod(mntnew.c_str(), mtab_info.st_mode) != 0) &&
-        (chown(mntnew.c_str(), mtab_info.st_uid, mtab_info.st_gid) != 0))
-    {
+    if (!fmntnew && (chmod(mntnew.c_str(), mtab_info.st_mode) != 0) &&
+        (chown(mntnew.c_str(), mtab_info.st_uid, mtab_info.st_gid) != 0)) {
       endmntent(fmntold);
       flock(fd_lockfile, LOCK_UN);
       close(fd_lockfile);
@@ -120,18 +118,17 @@ inline bool platform_umount(const char* mountpoint, const bool lazy) {
     flock(fd_lockfile, LOCK_UN);
     close(fd_lockfile);
     unlink(lockfile.c_str());
-    if (retval != 0)
-      return false;
+    if (retval != 0) return false;
     // Best effort
-    (void)chmod(_PATH_MOUNTED, mtab_info.st_mode);
-    (void)chown(_PATH_MOUNTED, mtab_info.st_uid, mtab_info.st_gid);
+    retval = chmod(_PATH_MOUNTED, mtab_info.st_mode);
+    retval = chown(_PATH_MOUNTED, mtab_info.st_uid, mtab_info.st_gid);
+    // We pickup these values only to silent warnings
   }
 
   int flags = lazy ? MNT_DETACH : 0;
   retval = umount2(mountpoint, flags);
   return retval == 0;
 }
-
 
 /**
  * Spinlocks are not necessarily part of pthread on all platforms.
@@ -150,14 +147,14 @@ inline int platform_spinlock_trylock(platform_spinlock *lock) {
   return pthread_spin_trylock(lock);
 }
 
+inline void platform_spinlock_unlock(platform_spinlock *lock) {
+  pthread_spin_unlock(lock);
+}
 
 /**
  * pthread_self() is not necessarily an unsigned long.
  */
-inline pthread_t platform_gettid() {
-  return pthread_self();
-}
-
+inline pthread_t platform_gettid() { return pthread_self(); }
 
 inline int platform_sigwait(const int signum) {
   sigset_t sigset;
@@ -168,7 +165,6 @@ inline int platform_sigwait(const int signum) {
   retval = sigwaitinfo(&sigset, NULL);
   return retval;
 }
-
 
 /**
  * Grants a PID capabilites for ptrace() usage
@@ -192,7 +188,6 @@ inline bool platform_allow_ptrace(const pid_t pid) {
   return true;
 #endif
 }
-
 
 /**
  * File system functions, ensure 64bit versions.
@@ -219,8 +214,7 @@ inline int platform_fstat(int filedes, platform_stat64 *buf) {
 
 // TODO(jblomer): the translation from C to C++ should be done elsewhere
 inline bool platform_getxattr(const std::string &path, const std::string &name,
-                              std::string *value)
-{
+                              std::string *value) {
   int size = 0;
   void *buffer = NULL;
   int retval;
@@ -244,31 +238,21 @@ inline bool platform_getxattr(const std::string &path, const std::string &name,
 }
 
 // TODO(jblomer): the translation from C to C++ should be done elsewhere
-inline bool platform_setxattr(
-  const std::string &path,
-  const std::string &name,
-  const std::string &value)
-{
-  int retval = setxattr(
-    path.c_str(), name.c_str(), value.c_str(), value.size(), 0);
+inline bool platform_setxattr(const std::string &path, const std::string &name,
+                              const std::string &value) {
+  int retval =
+      setxattr(path.c_str(), name.c_str(), value.c_str(), value.size(), 0);
   return retval == 0;
 }
 
-
-inline ssize_t platform_lgetxattr(
-  const char *path,
-  const char *name,
-  void *value,
-  size_t size
-) {
+inline ssize_t platform_lgetxattr(const char *path, const char *name,
+                                  void *value, size_t size) {
   return lgetxattr(path, name, value, size);
 }
-
 
 inline ssize_t platform_llistxattr(const char *path, char *list, size_t size) {
   return llistxattr(path, list, size);
 }
-
 
 inline void platform_disable_kcache(int filedes) {
   (void)posix_fadvise(filedes, 0, 0, POSIX_FADV_RANDOM | POSIX_FADV_NOREUSE);
@@ -278,31 +262,63 @@ inline int platform_readahead(int filedes) {
   return readahead(filedes, 0, static_cast<size_t>(-1));
 }
 
+/**
+ * Advises the kernel to evict the given file region from the page cache.
+ *
+ * Note: Pages containing the data at `offset` and `offset + length` are NOT
+ *       evicted by the kernel. This means that a few pages are not purged when
+ *       offset and length are not exactly on page boundaries. See below:
+ *
+ *                offset                                  length
+ *                  |                                        |
+ *   +---------+----|----+---------+---------+---------+-----|---+---------+
+ *   |         |    |    | xxxxxxx | xxxxxxx | xxxxxxx |     |   |         |
+ *   |         |    |    | xxxxxxx | xxxxxxx | xxxxxxx |     |   |         |
+ *   +---------+----|----+---------+---------+---------+-----|---+---------+
+ *   0       4096   |  8192      12288     16384     20480   | 24576     28672
+ *
+ * git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/mm/fadvise.c#n115
+ *
+ * TODO(rmeusel): figure out a clever way how to align `offset` and `length`
+ *
+ * @param fd      file descriptor whose page cache should be (partially) evicted
+ * @param offset  start offset of the pages to be evicted
+ * @param length  number of bytes to be evicted
+ */
+inline int platform_invalidate_kcache(const int fd, const off_t offset,
+                                      const size_t length) {
+  return posix_fadvise(fd, offset, length, POSIX_FADV_DONTNEED);
+}
 
 inline std::string platform_libname(const std::string &base_name) {
   return "lib" + base_name + ".so";
 }
 
-
-inline const char* platform_getexepath() {
+inline const char *platform_getexepath() {
   static char buf[PATH_MAX] = {0};
   if (strlen(buf) == 0) {
     int ret = readlink("/proc/self/exe", buf, PATH_MAX);
     if (ret > 0 && ret < static_cast<int>(PATH_MAX)) {
-       buf[ret] = 0;
+      buf[ret] = 0;
     }
   }
   return buf;
 }
 
-inline void platform_get_os_version(int32_t *major,
-                                    int32_t *minor,
-                                    int32_t *patch) {
-  struct utsname uts_info;
-  const int res = uname(&uts_info);
-  assert(res == 0);
-  const int matches = sscanf(uts_info.release, "%u.%u.%u", major, minor, patch);
-  assert(matches == 3 && "failed to read version string");
+inline uint64_t platform_monotonic_time() {
+  struct timespec tp;
+#ifdef CLOCK_MONOTONIC_COARSE
+  int retval = clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
+#else
+  int retval = clock_gettime(CLOCK_MONOTONIC, &tp);
+#endif
+  assert(retval == 0);
+  return tp.tv_sec + (tp.tv_nsec >= 500000000);
+}
+
+inline uint64_t platform_memsize() {
+  return static_cast<uint64_t>(sysconf(_SC_PHYS_PAGES)) *
+         static_cast<uint64_t>(sysconf(_SC_PAGE_SIZE));
 }
 
 #ifdef CVMFS_NAMESPACE_GUARD

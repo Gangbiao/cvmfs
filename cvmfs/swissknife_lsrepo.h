@@ -22,24 +22,28 @@ class CommandListCatalogs : public Command {
  public:
   CommandListCatalogs();
   ~CommandListCatalogs() { }
-  std::string GetName() { return "lsrepo"; }
-  std::string GetDescription() {
+  virtual std::string GetName() const { return "lsrepo"; }
+  virtual std::string GetDescription() const {
     return "CernVM File System Repository Traversal\n"
       "This command lists the nested catalog tree that builds up a "
       "cvmfs repository structure.";
   }
-  ParameterList GetParams();
+  virtual ParameterList GetParams() const;
 
   int Main(const ArgumentList &args);
 
  protected:
   template <class ObjectFetcherT>
-  bool Run(ObjectFetcherT *object_fetcher) {
+  bool Run(const shash::Any &manual_root_hash,
+           ObjectFetcherT *object_fetcher)
+  {
     typename CatalogTraversal<ObjectFetcherT>::Parameters params;
     params.object_fetcher = object_fetcher;
     CatalogTraversal<ObjectFetcherT> traversal(params);
     traversal.RegisterListener(&CommandListCatalogs::CatalogCallback, this);
-    return traversal.Traverse();
+    if (manual_root_hash.IsNull())
+      return traversal.Traverse();
+    return traversal.Traverse(manual_root_hash);
   }
 
   void CatalogCallback(const CatalogTraversalData<catalog::Catalog> &data);

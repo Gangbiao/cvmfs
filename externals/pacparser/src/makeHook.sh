@@ -7,7 +7,7 @@ static_result_dir=src/static
 echo "make clean && make for libpacparser (omitting test execution)..."
 [ -d $static_result_dir ] && rm -fR $static_result_dir
 make -C src clean
-make -j1 -C src pacparser.o libjs.a # default target runs tests!
+make CVMFS_BASE_C_FLAGS="$CVMFS_BASE_C_FLAGS" -j1 -C src pacparser.o libjs.a # default target runs tests!
 echo "finished internal build of libpacparser"
 
 echo "creating static link library for libpacparser..."
@@ -24,3 +24,8 @@ echo "finished creating static link library for libpacparser"
 echo "stripping debug symbols for libpacparser..."
 strip -S libpacparser.a
 echo "finished building libpacparser.a"
+
+# Install
+cd ../../
+cp -v src/*.h $EXTERNALS_INSTALL_LOCATION/include/
+cp -v $static_result_dir/libpacparser.a $EXTERNALS_INSTALL_LOCATION/lib/

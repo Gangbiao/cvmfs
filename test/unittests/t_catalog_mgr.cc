@@ -7,12 +7,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../cvmfs/catalog.h"
-#include "../../cvmfs/catalog_balancer.h"
-#include "../../cvmfs/catalog_mgr.h"
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/shortstring.h"
-#include "../../cvmfs/util.h"
+#include "catalog.h"
+#include "catalog_balancer.h"
+#include "catalog_mgr.h"
+#include "hash.h"
+#include "shortstring.h"
 #include "testutil.h"
 
 using namespace std;  // NOLINT
@@ -79,7 +78,10 @@ class T_CatalogManager : public ::testing::Test {
     string catalog_path_str = "/dir/dir/dir";
     PathString catalog_path(catalog_path_str.c_str(),
                             catalog_path_str.length());
-    MockCatalog *new_catalog = new MockCatalog("/dir/dir/dir", shash::Any(),
+    hash = shash::Any(shash::kSha1,
+                      reinterpret_cast<const unsigned char*>(hashes[5]),
+                      suffix);
+    MockCatalog *new_catalog = new MockCatalog("/dir/dir/dir", hash,
                                                4096, 1, 0, false,
                                                root_catalog, NULL);
     ASSERT_NE(static_cast<MockCatalog*>(NULL), new_catalog);
@@ -127,7 +129,8 @@ const char *T_CatalogManager::hashes[] = {
      "26ab0db90d72e28ad0ba1e22ee510510000000",
      "6d7fce9fee471194aa8b5b6e47267f03000000",
      "48a24b70a0b376535542b996af517398000000",
-     "1dcca23355272056f04fe8bf20edfce0000000"
+     "1dcca23355272056f04fe8bf20edfce0000000",
+     "11111111111111111111111111111111111111"
 };
 
 
@@ -136,7 +139,7 @@ TEST_F(T_CatalogManager, InitialConfiguration) {
   EXPECT_TRUE(catalog_mgr_.Init());
   EXPECT_EQ(1, catalog_mgr_.GetNumCatalogs());
   EXPECT_EQ(1u, catalog_mgr_.GetRevision());
-  EXPECT_FALSE(catalog_mgr_.GetVolatileFlag());
+  EXPECT_FALSE(catalog_mgr_.volatile_flag());
   EXPECT_EQ(0u, catalog_mgr_.GetTTL());
 }
 
@@ -173,27 +176,19 @@ TEST_F(T_CatalogManager, Lookup) {
   EXPECT_TRUE(dirent.IsDirectory());
   EXPECT_TRUE(catalog_mgr_.LookupPath("/file1", kLookupSole, &dirent));
   EXPECT_TRUE(dirent.IsRegular());
-  EXPECT_TRUE(catalog_mgr_.LookupPath("/file1", kLookupFull, &dirent));
-  EXPECT_TRUE(dirent.IsRegular());
-  // the father directory belongs to the catalog, so there is no problem
-  EXPECT_TRUE(catalog_mgr_.LookupPath("/dir/dir/file2", kLookupFull, &dirent));
-  EXPECT_TRUE(dirent.IsRegular());
   // /dir/dir/dir/file4 belongs to a catalog that is not mounted yet
   EXPECT_TRUE(catalog_mgr_.LookupPath("/dir/dir/dir/file4", kLookupSole,
                                       &dirent));
   // the new catalog should be mounted now
   EXPECT_EQ(2, catalog_mgr_.GetNumCatalogs());
 
-  // the father directory should also belong to the nested catalog
-  EXPECT_TRUE(catalog_mgr_.LookupPath("/dir/dir/dir/file4", kLookupFull,
-                                      &dirent));
   // it is not a symplink, so it should crash
   EXPECT_DEATH(catalog_mgr_.LookupPath("/dir/dir/dir/file4", kLookupRawSymlink,
                                       &dirent), ".*");
 
   // load the next catalog
   EXPECT_TRUE(catalog_mgr_.LookupPath("/dir/dir/dir/dir/dir/file5",
-                                      kLookupFull, &dirent));
+                                      kLookupSole, &dirent));
   // the new catalog should be mounted now
   EXPECT_EQ(3, catalog_mgr_.GetNumCatalogs());
 }
@@ -203,7 +198,7 @@ TEST_F(T_CatalogManager, LongLookup) {
   ASSERT_TRUE(catalog_mgr_.Init());
   AddTree();
   EXPECT_TRUE(catalog_mgr_.LookupPath("/dir/dir/dir/dir/dir/file5",
-                                      kLookupFull, &dirent));
+                                      kLookupSole, &dirent));
   EXPECT_TRUE(dirent.IsRegular());
   // we should have mounted two catalogs
   EXPECT_EQ(3, catalog_mgr_.GetNumCatalogs());
@@ -229,6 +224,15 @@ TEST_F(T_CatalogManager, Listing) {
   EXPECT_TRUE(catalog_mgr_.Listing("/dir/dir/dir/dir/dir", &del));
   EXPECT_EQ(1u, del.size());
   EXPECT_EQ(3, catalog_mgr_.GetNumCatalogs());
+
+  EXPECT_EQ(shash::Any(),
+    catalog_mgr_.GetNestedCatalogHash(PathString("/file1")));
+  EXPECT_EQ(shash::Any(),
+    catalog_mgr_.GetNestedCatalogHash(PathString("/file1")));
+  shash::Any hash_nested = shash::Any(shash::kSha1,
+    reinterpret_cast<const unsigned char*>(hashes[5]), 'C');
+  EXPECT_EQ(hash_nested,
+    catalog_mgr_.GetNestedCatalogHash(PathString("/dir/dir/dir")));
 }
 
 TEST_F(T_CatalogManager, LongListing) {
@@ -284,7 +288,7 @@ TEST_F(T_CatalogManager, Balance) {
 
   // load the other catalogs so that they can be removed
   EXPECT_TRUE(catalog_mgr_.LookupPath("/dir/dir/dir/dir/dir/file5",
-                                      kLookupFull, &dirent));
+                                      kLookupSole, &dirent));
 }
 
 TEST_F(T_CatalogManager, Remount) {

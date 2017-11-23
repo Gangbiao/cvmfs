@@ -9,11 +9,12 @@
 
 #include "backoff.h"
 #include "cache.h"
+#include "clientctx.h"
 #include "download.h"
 #include "logging.h"
 #include "quota.h"
 #include "statistics.h"
-#include "util.h"
+#include "util/posix.h"
 
 using namespace std;  // NOLINT
 
@@ -77,7 +78,10 @@ int Fetcher::Fetch(
   const shash::Any &id,
   const uint64_t size,
   const std::string &name,
-  const cache::CacheManager::ObjectType object_type)
+  const zlib::Algorithms compression_algorithm,
+  const CacheManager::ObjectType object_type,
+  const std::string &alt_url,
+  off_t range_offset)
 {
   int fd_return;  // Read-only file descriptor that is returned
   int retval;
@@ -121,7 +125,12 @@ int Fetcher::Fetch(
 
   // Involve the download manager
   LogCvmfs(kLogCache, kLogDebug, "downloading %s", name.c_str());
-  const string url = "/data/" + id.MakePath();
+  std::string url;
+  if (external_) {
+    url = !alt_url.empty() ? alt_url : name;
+  } else {
+    url = "/" + (alt_url.size() ? alt_url : "data/" + id.MakePath());
+  }
   void *txn = alloca(cache_mgr_->SizeOfTxn());
   retval = cache_mgr_->StartTxn(id, size, txn);
   if (retval < 0) {
@@ -130,7 +139,7 @@ int Fetcher::Fetch(
     SignalWaitingThreads(retval, id, tls);
     return retval;
   }
-  cache_mgr_->CtrlTxn(name, object_type, 0, txn);
+  cache_mgr_->CtrlTxn(CacheManager::ObjectInfo(object_type, name), 0, txn);
 
   LogCvmfs(kLogCache, kLogDebug, "miss: %s %s", name.c_str(), url.c_str());
   TransactionSink sink(cache_mgr_, txn);
@@ -138,6 +147,15 @@ int Fetcher::Fetch(
   tls->download_job.destination_sink = &sink;
   tls->download_job.expected_hash = &id;
   tls->download_job.extra_info = &name;
+  ClientCtx *ctx = ClientCtx::GetInstance();
+  if (ctx->IsSet()) {
+    ctx->Get(&tls->download_job.uid,
+             &tls->download_job.gid,
+             &tls->download_job.pid);
+  }
+  tls->download_job.compressed = (compression_algorithm == zlib::kZlibDefault);
+  tls->download_job.range_offset = range_offset;
+  tls->download_job.range_size = size;
   download_mgr_->Fetch(&tls->download_job);
 
   if (tls->download_job.error_code == download::kFailOk) {
@@ -173,11 +191,13 @@ int Fetcher::Fetch(
 
 
 Fetcher::Fetcher(
-  cache::CacheManager *cache_mgr,
+  CacheManager *cache_mgr,
   download::DownloadManager *download_mgr,
   BackoffThrottle *backoff_throttle,
-  perf::Statistics *statistics)
-  : lock_queues_download_(NULL)
+  perf::StatisticsTemplate statistics,
+  bool external)
+  : external_(external)
+  , lock_queues_download_(NULL)
   , lock_tls_blocks_(NULL)
   , cache_mgr_(cache_mgr)
   , download_mgr_(download_mgr)
@@ -194,7 +214,7 @@ Fetcher::Fetcher(
     smalloc(sizeof(pthread_mutex_t)));
   retval = pthread_mutex_init(lock_tls_blocks_, NULL);
   assert(retval == 0);
-  n_downloads = statistics->Register("fetch.n_downloads",
+  n_downloads = statistics.RegisterTemplated("n_downloads",
     "overall number of downloaded files (incl. catalogs, chunks)");
 }
 
@@ -227,13 +247,13 @@ Fetcher::~Fetcher() {
 int Fetcher::OpenSelect(
   const shash::Any &id,
   const std::string &name,
-  const cache::CacheManager::ObjectType object_type)
+  const CacheManager::ObjectType object_type)
 {
-  bool is_catalog = object_type == cache::CacheManager::kTypeCatalog;
-  if (is_catalog || (object_type == cache::CacheManager::kTypePinned)) {
+  bool is_catalog = object_type == CacheManager::kTypeCatalog;
+  if (is_catalog || (object_type == CacheManager::kTypePinned)) {
     return cache_mgr_->OpenPinned(id, name, is_catalog);
   } else {
-    return cache_mgr_->Open(id);
+    return cache_mgr_->Open(CacheManager::Bless(id, object_type, name));
   }
 }
 

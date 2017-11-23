@@ -19,29 +19,30 @@
  *
  * There are a number of different entities involved in this process. Namely:
  *   -> Spooler            - general steering tasks ( + common interface )
- *   -> FileProcessor      - chunking, compression and hashing of files
+ *   -> IngestionPipeline  - chunking, compression and hashing of files
  *   -> AbstractUploader   - abstract base class for uploading facilities
  *   -> concrete Uploaders - upload functionality for various backend storages
  *
- * Stage 1 aka. the processing of files is handled by the FileProcessor, since
- * it is independent from the actual uploading this functionality is outsourced.
- * The FileProcessor will take care of the above mentioned steps in a concurrent
- * fashion. This process is invoked by calling Spooler::Process().
- * While processing, the FileProcessor immediately schedules Upload jobs in
- * order to push data to the backend storage as early as possible.
+ * Stage 1 aka. the processing of files is handled by the IngestionPipeline,
+ * since it is independent from the actual uploading this functionality is
+ * outsourced. The IngestionPipeline will take care of the above mentioned steps
+ * in a concurrent fashion. This process is invoked by calling
+ * Spooler::Process(). While processing, the IngestionPipeline immediately
+ * schedules Upload jobs in order to push data to the backend storage as early
+ *  as possible.
  *
  * Stage 2 aka. the upload is handled by one of the concrete Uploader classes.
  * Uploaders have a thin interface described in the AbstractUploader class.
- * The FileProcessor uses a concrete Uploader to push files into the backend
+ * The IngestionPipeline uses a concrete Uploader to push files into the backend
  * storage as part of it's processing.
  * Furthermore the user can directly upload files using the Spooler::Upload()
  * method as described in the next paragraph.
  *
- * For some specific files we need to be able to circumvent the FileProcessor to
- * directly push them into the backend storage (i.e. .cvmfspublished). For this
- * Spooler::Upload() is used. It directly schedules an upload job in the used
- * concrete Uploader facility. These files will not get compressed or check-
- * summed by any means.
+ * For some specific files we need to be able to circumvent the
+ * IngestionPipeline to directly push them into the backend storage (i.e.
+ * .cvmfspublished). For this Spooler::Upload() is used. It directly schedules
+ * an upload job in the used concrete Uploader facility. These files will not
+ * get compressed or check-summed by any means.
  *
  * In any case, calling Spooler::Process() or Spooler::Upload() will invoke a
  * callback once the whole job has been finished. Callbacks are provided by the
@@ -62,10 +63,10 @@
  *   / \                         |
  *    |                          |
  *    | Process()                |          File
- *    +-----------> ################### ---------------------> #################
- *    | Upload()    #     Spooler     #                        # FileProcessor #
- *    +-----------> ################### <--------------------- #################
- *                   |               ^    FileProcessor::Results   |    ^
+ *    +-----------> ################### -----------------> #####################
+ *    | Upload()    #     Spooler     #                    # IngestionPipeline #
+ *    +-----------> ################### <----------------- #####################
+ *                   |               ^      SpoolerResult          |    ^
  *                   |               |                             |    |
  *     direct Upload |      Callback |                             |    |
  *                  `|´              |            Schedule Upload  |    |
@@ -79,6 +80,30 @@
  *                 *  Backend Storage  *
  *                 *********************
  *
+ *
+ * TODO(rmeusel): special purpose ::Process...() methods should (opionally?)
+ *                return Future<> instead of relying on the callbacks. Those are
+ *                somewhat one-shot calls and require a rather fishy idiom when
+ *                using callbacks, like:
+ *
+ *                   cb = spooler->RegisterListener(...certificate_callback...);
+ *                   spooler->ProcessCertificate(...);
+ *                   spooler->WaitForUpload();
+ *                   spooler->UnregisterListener(cb);
+ *                   cert_hash = global_cert_hash;
+ *
+ *                   void certificate_callback(shash::Any &hash) {
+ *                     global_cert_hash = hash;
+ *                   }
+ *
+ *                If ProcessCertificate(), ProcessHistory(), ProcessMetainfo(),
+ *                UploadManifest() and UploaderReflog() would return Future<>,
+ *                the code would be much more comprehensible and free of user-
+ *                managed global state:
+ *
+ *                   Future<shash::Any> fc = spooler->ProcessCertificate(...);
+ *                   cert_hash = fc.get();
+ *
  */
 
 #ifndef CVMFS_UPLOAD_H_
@@ -89,11 +114,12 @@
 #include <vector>
 
 #include "file_chunk.h"
-#include "file_processing/file_processor.h"
 #include "hash.h"
+#include "ingestion/pipeline.h"
 #include "upload_facility.h"
 #include "upload_spooler_definition.h"
 #include "upload_spooler_result.h"
+#include "util/pointer.h"
 
 namespace upload {
 
@@ -116,7 +142,7 @@ namespace upload {
  */
 class Spooler : public Observable<SpoolerResult> {
  public:
-  static Spooler* Construct(const SpoolerDefinition &spooler_definition);
+  static Spooler *Construct(const SpoolerDefinition &spooler_definition);
   virtual ~Spooler();
 
   /**
@@ -136,8 +162,21 @@ class Spooler : public Observable<SpoolerResult> {
    * @param remote_path   the destination of the file to be copied in the
    *                      backend storage
    */
-  void Upload(const std::string &local_path,
-              const std::string &remote_path);
+  void Upload(const std::string &local_path, const std::string &remote_path);
+
+  /**
+   * Convenience wrapper to upload the Manifest file into the backend storage
+   *
+   * @param local_path  the location of the (signed) manifest to be uploaded
+   */
+  void UploadManifest(const std::string &local_path);
+
+  /**
+   * Convenience wrapper to upload a Reflog database into the backend storage
+   *
+   * @param local_path  the SQLite file location of the Reflog to be uploaded
+   */
+  void UploadReflog(const std::string &local_path);
 
   /**
    * Schedules a process job that compresses and hashes the provided file in
@@ -156,8 +195,7 @@ class Spooler : public Observable<SpoolerResult> {
    * @param allow_chunking  (optional) controls if this file should be cut in
    *                        chunks or uploaded at once
    */
-  void Process(const std::string &local_path,
-               const bool         allow_chunking = true);
+  void Process(const std::string &local_path, const bool allow_chunking = true);
 
   /**
    * Convenience wrapper to process a catalog file. Please always use this
@@ -167,7 +205,6 @@ class Spooler : public Observable<SpoolerResult> {
    */
   void ProcessCatalog(const std::string &local_path);
 
-
   /**
    * Convenience wrapper to process a history database file. This sets the
    * processing parameters (like chunking and hash suffixes) accordingly.
@@ -175,7 +212,6 @@ class Spooler : public Observable<SpoolerResult> {
    * @param local_path  the location of the history database file
    */
   void ProcessHistory(const std::string &local_path);
-
 
   /**
    * Convenience wrapper to process a certificate file. This sets the
@@ -185,6 +221,12 @@ class Spooler : public Observable<SpoolerResult> {
    */
   void ProcessCertificate(const std::string &local_path);
 
+  /**
+   * Convenience wrapper to process a meta info file.
+   *
+   * @param local_path  the location of the meta info file
+   */
+  void ProcessMetainfo(const std::string &local_path);
 
   /**
    * Deletes the given file from the repository backend storage. This is done
@@ -204,6 +246,16 @@ class Spooler : public Observable<SpoolerResult> {
   bool Peek(const std::string &path) const;
 
   /**
+   * Creates a top-level shortcut to the given data object. This is particularly
+   * useful for bootstrapping repositories whose data-directory is secured by
+   * a VOMS certificate.
+   *
+   * @param object  content hash of the object to be exposed on the top-level
+   * @return        true on success
+   */
+  bool PlaceBootstrappingShortcut(const shash::Any &object) const;
+
+  /**
    * Blocks until all jobs currently under processing are finished. After it
    * returned, more jobs can be scheduled if needed.
    * Note: We assume that no one schedules new jobs while this method is in
@@ -211,6 +263,9 @@ class Spooler : public Observable<SpoolerResult> {
    *       does not get empty.
    */
   void WaitForUpload() const;
+
+  void FinalizeSession(bool commit, const std::string &old_root_hash = "",
+                       const std::string &new_root_hash = "") const;
 
   /**
    * Checks how many of the already processed jobs have failed.
@@ -222,7 +277,6 @@ class Spooler : public Observable<SpoolerResult> {
   shash::Algorithms GetHashAlgorithm() const {
     return spooler_definition_.hash_algorithm;
   }
-
 
  protected:
   /**
@@ -240,7 +294,7 @@ class Spooler : public Observable<SpoolerResult> {
   /**
    * Concrete implementations of the AbstractSpooler must call this method
    * when they finish an upload job. A single upload job might contain more
-   * than one file to be uploaded (see Upload(FileProcessor::Results) ).
+   * than one file to be uploaded.
    *
    * Note: If the concrete spooler implements uploading as an asynchronous
    *       task, this method MUST be called when all items for one upload
@@ -255,9 +309,8 @@ class Spooler : public Observable<SpoolerResult> {
   void JobDone(const SpoolerResult &result);
 
   /**
-   * Used internally: Is called when FileProcessor finishes a job.
-   * Automatically takes care of processed files and prepares them for upload
-   * by calling AbstractSpooler::Upload(FileProcessor::Results)
+   * Used internally: Is called when ingestion pipeline finishes a job.
+   * Automatically takes care of processed files and prepares them for upload.
    */
   void ProcessingCallback(const SpoolerResult &data);
 
@@ -267,16 +320,16 @@ class Spooler : public Observable<SpoolerResult> {
    * @return   the spooler definition that was initially given to any Spooler
    *           constructor.
    */
-  inline const SpoolerDefinition& spooler_definition() const {
+  inline const SpoolerDefinition &spooler_definition() const {
     return spooler_definition_;
   }
 
  private:
   // Status Information
-  const SpoolerDefinition      spooler_definition_;
+  const SpoolerDefinition spooler_definition_;
 
-  UniquePtr<FileProcessor>     file_processor_;
-  UniquePtr<AbstractUploader>  uploader_;
+  UniquePtr<IngestionPipeline> ingestion_pipeline_;
+  UniquePtr<AbstractUploader> uploader_;
 };
 
 }  // namespace upload

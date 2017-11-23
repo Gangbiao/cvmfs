@@ -13,7 +13,8 @@
 #include <vector>
 
 #include "atomic.h"
-#include "util.h"
+#include "util/async.h"
+#include "util/single_copy.h"
 
 #ifdef CVMFS_NAMESPACE_GUARD
 namespace CVMFS_NAMESPACE_GUARD {
@@ -411,6 +412,23 @@ class Observable : public Callbackable<ParamT>,
  */
 unsigned int GetNumberOfCpuCores();
 static const unsigned int kFallbackNumberOfCpus = 1;
+
+
+/**
+ * A blocking signal for thread synchronization
+ */
+class Signal : SingleCopy {
+ public:
+  Signal();
+  ~Signal();
+  void Wakeup();
+  void Wait();
+
+ private:
+  bool fired_;
+  pthread_mutex_t lock_;
+  pthread_cond_t signal_;
+};
 
 
 //

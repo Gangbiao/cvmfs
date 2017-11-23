@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "catalog.h"
+#include "util/posix.h"
 
 class XattrList;
 
@@ -35,6 +36,7 @@ class WritableCatalogManager;
 class WritableCatalog : public Catalog {
   friend class WritableCatalogManager;
   friend class swissknife::CommandMigrate;  // needed for catalog migrations
+  friend class VirtualCatalog;  // needed for /.cvmfs creation
 
  public:
   WritableCatalog(const std::string &path,
@@ -75,25 +77,35 @@ class WritableCatalog : public Catalog {
   // Creation and removal of catalogs
   void Partition(WritableCatalog *new_nested_catalog);
   void MergeIntoParent();
+  void RemoveFromParent();
 
   // Nested catalog references
   void InsertNestedCatalog(const std::string &mountpoint,
                            Catalog *attached_reference,
                            const shash::Any content_hash,
                            const uint64_t size);
-  void UpdateNestedCatalog(const std::string &path,
-                           const shash::Any &hash, const uint64_t size);
+  void InsertBindMountpoint(const std::string &mountpoint,
+                            const shash::Any content_hash,
+                            const uint64_t size);
+  void UpdateNestedCatalog(const std::string   &path,
+                           const shash::Any    &hash,
+                           const uint64_t       size,
+                           const DeltaCounters &child_counters);
   void RemoveNestedCatalog(const std::string &mountpoint,
                            Catalog **attached_reference);
+  void RemoveBindMountpoint(const std::string &mountpoint);
 
   void UpdateLastModified();
   void IncrementRevision();
   void SetRevision(const uint64_t new_revision);
+  void SetBranch(const std::string &branch_name);
   void SetPreviousRevision(const shash::Any &hash);
+  void SetTTL(const uint64_t new_ttl);
+  bool SetVOMSAuthz(const std::string &voms_authz);
 
  protected:
-  static const double kMaximalFreePageRatio   = 0.20;
-  static const double kMaximalRowIdWasteRatio = 0.25;
+  static const double kMaximalFreePageRatio;  // = 0.2
+  static const double kMaximalRowIdWasteRatio;  // = 0.25;
 
   CatalogDatabase::OpenMode DatabaseOpenMode() const {
     return CatalogDatabase::kOpenReadWrite;
@@ -124,6 +136,14 @@ class WritableCatalog : public Catalog {
     return static_cast<WritableCatalog *>(parent);
   }
 
+  int dirty_children() const { return atomic_read32(&dirty_children_); }
+  void set_dirty_children(const int count) {
+    atomic_write32(&dirty_children_, count);
+  }
+  int DecrementDirtyChildren() {
+    return atomic_xadd32(&dirty_children_, -1) - 1;
+  }
+
  private:
   SqlDirentInsert     *sql_insert_;
   SqlDirentUnlink     *sql_unlink_;
@@ -138,6 +158,9 @@ class WritableCatalog : public Catalog {
   bool dirty_;  /**< Indicates if the catalog has been changed */
 
   DeltaCounters delta_counters_;
+
+  // parallel commit state
+  mutable atomic_int32 dirty_children_;
 
   inline void SetDirty() {
     if (!dirty_)

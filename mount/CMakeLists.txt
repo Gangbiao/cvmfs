@@ -1,10 +1,10 @@
+set (CVMFS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/cvmfs")
 set (CVMFS_MOUNT_SOURCES
-  ../cvmfs/smalloc.h
-  ../cvmfs/platform.h ../cvmfs/platform_linux.h ../cvmfs/platform_osx.h
-  ../cvmfs/util.h ../cvmfs/util.cc
-  ../cvmfs/logging.h ../cvmfs/logging_internal.h ../cvmfs/logging.cc
-  ../cvmfs/options.h ../cvmfs/options.cc
-  ../cvmfs/sanitizer.h ../cvmfs/sanitizer.cc
+  ${CVMFS_SOURCE_DIR}/logging.cc
+  ${CVMFS_SOURCE_DIR}/options.cc
+  ${CVMFS_SOURCE_DIR}/sanitizer.cc
+  ${CVMFS_SOURCE_DIR}/util/posix.cc
+  ${CVMFS_SOURCE_DIR}/util/string.cc
   mount.cvmfs.cc
 )
 
@@ -38,6 +38,12 @@ if (MACOSX)
   )
 
   install (
+    FILES         default.d/10-osx.conf
+    DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/default.d"
+    PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+  )
+
+  install (
     FILES         default.d/50-cern.conf
     DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/default.d"
     PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
@@ -60,7 +66,7 @@ if (MACOSX)
     DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/domain.d"
     PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
   )
-  
+
   install (
     FILES         domain.d/egi.eu.conf
     DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/domain.d"
@@ -75,12 +81,6 @@ if (MACOSX)
 
   install (
     FILES         config.d/grid.cern.ch.conf
-    DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/config.d"
-    PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
-  )
-
-  install (
-    FILES         config.d/atlas-nightlies.cern.ch.conf
     DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/config.d"
     PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
   )
@@ -105,13 +105,13 @@ if (MACOSX)
     )
 
     install (
-      FILES         keys/cern-it2.cern.ch.pub
+      FILES         keys/cern-it4.cern.ch.pub
       DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/keys/cern.ch"
       PERMISSIONS   OWNER_READ GROUP_READ WORLD_READ
     )
 
     install (
-      FILES         keys/cern-it3.cern.ch.pub
+      FILES         keys/cern-it5.cern.ch.pub
       DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/keys/cern.ch"
       PERMISSIONS   OWNER_READ GROUP_READ WORLD_READ
     )
@@ -141,15 +141,20 @@ else (MACOSX)
   )
   add_executable (auto.cvmfs ${CVMFS_AUTO_SOURCES})
 
-  SET( autofsmap_link    /etc/auto.cvmfs)
-  SET( autofsmap_dest    /usr/libexec/cvmfs)
-  SET( autofsmap_target  ${autofsmap_dest}/auto.cvmfs)
   install (
     TARGETS       auto.cvmfs
-    DESTINATION   ${autofsmap_dest}
+    DESTINATION   ${CVMFS_LIBEXEC_DIR}
     PERMISSIONS   OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
   )
-  # Symlink /etc/auto.cvmfs --> /sbin/auto.cvmfs
+
+  if (ARCHLINUX)
+    SET( autofsmap_link    /etc/autofs/auto.cvmfs)
+  else (ARCHLINUX)
+    SET( autofsmap_link    /etc/auto.cvmfs)
+  endif (ARCHLINUX)
+  SET( autofsmap_dest    ${CMAKE_INSTALL_PREFIX}/${CVMFS_LIBEXEC_DIR})
+  SET( autofsmap_target  ${autofsmap_dest}/auto.cvmfs)
+  # Symlink /etc/(autofs)/auto.cvmfs --> /usr/lib(exec)/cvmfs/auto.cvmfs
   install(CODE "
     if (\"\$ENV{DESTDIR}\" STREQUAL \"\")
       execute_process(COMMAND ln -sf
@@ -179,6 +184,14 @@ else (MACOSX)
     DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/default.d"
     PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
   )
+
+  if (ARCHLINUX)
+    install (
+      FILES         default.d/10-arch.conf
+      DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/default.d"
+      PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+    )
+  endif (ARCHLINUX)
 
   if (DEBIAN)
     install (
@@ -225,12 +238,6 @@ else (MACOSX)
   )
 
   install (
-    FILES         config.d/atlas-nightlies.cern.ch.conf
-    DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/config.d"
-    PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
-  )
-
-  install (
     FILES         config.d/cms.cern.ch.conf
     DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/config.d"
     PERMISSIONS   OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
@@ -250,13 +257,13 @@ else (MACOSX)
     )
 
     install (
-      FILES         keys/cern-it2.cern.ch.pub
+      FILES         keys/cern-it4.cern.ch.pub
       DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/keys/cern.ch"
       PERMISSIONS   OWNER_READ GROUP_READ WORLD_READ
     )
 
     install (
-      FILES         keys/cern-it3.cern.ch.pub
+      FILES         keys/cern-it5.cern.ch.pub
       DESTINATION   "${SYSCONF_INSTALL_DIR}/cvmfs/keys/cern.ch"
       PERMISSIONS   OWNER_READ GROUP_READ WORLD_READ
     )

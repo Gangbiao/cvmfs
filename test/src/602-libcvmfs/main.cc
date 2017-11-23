@@ -16,13 +16,13 @@
 using namespace std;  // NOLINT
 
 const char *repo_options =
-  "repo_name=%s,url=http://localhost/cvmfs/%s,"
+  "repo_name=%s,url=%s,"
   "pubkey=/etc/cvmfs/keys/%s.pub,"
   "proxies=DIRECT";
 
 int main(int argc, char *argv[]) {
-  if (argc < 3) {
-    printf("Not enough arguments\n");
+  if (argc < 4) {
+    printf("Usage: %s <base URL> <base repo name> <# repos>\n", argv[0]);
     return -2;
   }
   const char *global_options = "cache_directory=/tmp/test-libcvmfs-cache";
@@ -32,18 +32,24 @@ int main(int argc, char *argv[]) {
     return -1;
   }
   cvmfs_context *ctx = NULL;
-  string base_repo_name = argv[1];
-  int num_repos = atoi(argv[2]);
+  string base_url       = argv[1];
+  string base_repo_name = argv[2];
+  int    num_repos      = atoi(argv[3]);
   vector<cvmfs_context*> ctx_vector;
   char options[TEST_LINE_MAX];
 
   for (int counter = 1; counter <= num_repos; ++counter) {
-    ostringstream s;
-    s << base_repo_name;
-    s << counter;
-    string repo_name = s.str();
+    ostringstream rn;
+    rn << base_repo_name << counter;
+    string repo_name = rn.str();
+
+    ostringstream ru;
+    ru << base_url
+      << '/'
+      << repo_name;
+    string repo_url = ru.str();
     snprintf(options, TEST_LINE_MAX, repo_options, repo_name.c_str(),
-      repo_name.c_str(), repo_name.c_str());
+      repo_url.c_str(), repo_name.c_str());
     printf("Trying to mount with options:\n%s\n", options);
     ctx = cvmfs_attach_repo(options);
     ctx_vector.push_back(ctx);
@@ -68,6 +74,7 @@ int main(int argc, char *argv[]) {
       printf("Failed to verify value: %d != %d", number, counter);
       return -3;
     }
+    cvmfs_close(ctx, fd);
 
     // second test: check that listing /${testname}/list produces
     // ${counter} entries
@@ -90,6 +97,31 @@ int main(int argc, char *argv[]) {
         "Current: %d       Expected: %d\n", num_elem, num_repos);
       return -6;
     }
+
+    // third test: read large file
+    string largefile_path = "/large";
+    fd = cvmfs_open(ctx, largefile_path.c_str());
+    if (fd < 0) {
+      printf("Couldn't perform the lookup operation in %s\n",
+             largefile_path.c_str());
+      return fd;
+    }
+    if (fd < (1 << 30)) {
+      printf("Expected a chunk file but this is not (%d)\n", fd);
+      return -7;
+    }
+    char page_buf[4096];
+    ssize_t nbytes;
+    off_t off = 0;
+    while ((nbytes = cvmfs_pread(ctx, fd, page_buf, 4096, off)) > 0) {
+      off += nbytes;
+    }
+    if (nbytes < 0) {
+      printf("Error reading chunked file %s (%d), read so far %ld\n",
+             largefile_path.c_str(), errno, off);
+      return nbytes;
+    }
+    cvmfs_close(ctx, fd);
   }
 
   for (int i = 0; i < ctx_vector.size(); ++i) {

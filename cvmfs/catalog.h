@@ -17,11 +17,11 @@
 #include "catalog_sql.h"
 #include "directory_entry.h"
 #include "file_chunk.h"
+#include "gtest/gtest_prod.h"
 #include "hash.h"
 #include "shortstring.h"
 #include "sql.h"
 #include "uid_map.h"
-#include "util.h"
 #include "xattr.h"
 
 namespace swissknife {
@@ -88,28 +88,32 @@ class InodeAnnotation {
  *
  * Read-only catalog. A sub-class provides read-write access.
  */
-class Catalog : public SingleCopy {
-  friend class AbstractCatalogManager<Catalog>;
-  friend class SqlLookup;                   // for mangled inode and uid maps
+class Catalog : SingleCopy {
+  FRIEND_TEST(T_Catalog, NormalizePath);
+  FRIEND_TEST(T_Catalog, PlantPath);
   friend class swissknife::CommandMigrate;  // for catalog version migration
 
  public:
   typedef std::vector<shash::Any> HashVector;
 
- public:
-  static const uint64_t kDefaultTTL = 900;  /**< 15 minutes default TTL */
+  /**
+   * The default TTL should be shorter than the autofs idle unmount time
+   * which is 5 minutes, because the config repo is accessed on every root
+   * catalog refresh and we want to avoid thrashing that mountpoint.
+   */
+  static const uint64_t kDefaultTTL = 240;  /**< 4 minutes default TTL */
 
   /**
    * Note: is_nested only has an effect if parent == NULL otherwise being
    *       a root catalog is determined by having a parent pointer or not.
    */
-  Catalog(const PathString  &path,
+  Catalog(const PathString  &mountpoint,
           const shash::Any  &catalog_hash,
                 Catalog     *parent,
           const bool         is_nested = false);
   virtual ~Catalog();
 
-  static Catalog *AttachFreely(const std::string  &root_path,
+  static Catalog *AttachFreely(const std::string  &imaginary_mountpoint,
                                const std::string  &file,
                                const shash::Any   &catalog_hash,
                                      Catalog      *parent    = NULL,
@@ -117,49 +121,41 @@ class Catalog : public SingleCopy {
 
   bool OpenDatabase(const std::string &db_path);
 
-  bool LookupMd5Path(const shash::Md5 &md5path, DirectoryEntry *dirent) const;
   inline bool LookupPath(const PathString &path, DirectoryEntry *dirent) const {
-    return LookupMd5Path(shash::Md5(path.GetChars(), path.GetLength()), dirent);
+    return LookupMd5Path(NormalizePath(path), dirent);
   }
   bool LookupRawSymlink(const PathString &path, LinkString *raw_symlink) const;
-  bool LookupXattrsMd5Path(const shash::Md5 &md5path, XattrList *xattrs) const;
   bool LookupXattrsPath(const PathString &path, XattrList *xattrs) const {
-    return LookupXattrsMd5Path(
-      shash::Md5(path.GetChars(), path.GetLength()), xattrs);
+    return LookupXattrsMd5Path(NormalizePath(path), xattrs);
   }
 
-  bool ListingMd5Path(const shash::Md5 &md5path,
-                      DirectoryEntryList *listing,
-                      const bool expand_symlink = true) const;
   inline bool ListingPath(const PathString &path,
                           DirectoryEntryList *listing,
                           const bool expand_symlink = true) const
   {
-    return ListingMd5Path(shash::Md5(path.GetChars(), path.GetLength()),
-                          listing, expand_symlink);
+    return ListingMd5Path(NormalizePath(path), listing, expand_symlink);
   }
-  bool ListingMd5PathStat(const shash::Md5 &md5path,
-                          StatEntryList *listing) const;
   bool ListingPathStat(const PathString &path,
                        StatEntryList *listing) const
   {
-    return ListingMd5PathStat(shash::Md5(path.GetChars(), path.GetLength()),
-                              listing);
+    return ListingMd5PathStat(NormalizePath(path), listing);
   }
   bool AllChunksBegin();
-  bool AllChunksNext(shash::Any *hash);
+  bool AllChunksNext(shash::Any *hash, zlib::Algorithms *compression_alg);
   bool AllChunksEnd();
 
   inline bool ListPathChunks(const PathString &path,
                              const shash::Algorithms interpret_hashes_as,
                              FileChunkList *chunks) const
   {
-    return ListMd5PathChunks(shash::Md5(path.GetChars(), path.GetLength()),
-                             interpret_hashes_as, chunks);
+    return ListMd5PathChunks(NormalizePath(path), interpret_hashes_as, chunks);
   }
-  bool ListMd5PathChunks(const shash::Md5 &md5path,
-                         const shash::Algorithms interpret_hashes_as,
-                         FileChunkList *chunks) const;
+
+  CatalogList GetChildren() const;
+  Catalog* FindSubtree(const PathString &path) const;
+  Catalog* FindChild(const PathString &mountpoint) const;
+  void AddChild(Catalog *child);
+  void RemoveChild(Catalog *child);
 
   const HashVector& GetReferencedObjects() const;
   void TakeDatabaseFileOwnership();
@@ -169,15 +165,18 @@ class Catalog : public SingleCopy {
   }
 
   uint64_t GetTTL() const;
+  bool HasExplicitTTL() const;
   uint64_t GetRevision() const;
+  bool GetVOMSAuthz(std::string *authz) const;
   uint64_t GetLastModified() const;
   uint64_t GetNumEntries() const;
   uint64_t GetNumChunks() const;
   shash::Any GetPreviousRevision() const;
   const Counters& GetCounters() const { return counters_; }
+  std::string PrintMemStatistics() const;
 
   inline float schema() const { return database().schema_version(); }
-  inline PathString path() const { return path_; }
+  inline PathString mountpoint() const { return mountpoint_; }
   inline Catalog* parent() const { return parent_; }
   inline uint64_t max_row_id() const { return max_row_id_; }
   inline InodeRange inode_range() const { return inode_range_; }
@@ -196,27 +195,41 @@ class Catalog : public SingleCopy {
     DirectoryEntry dirent;
     assert(IsInitialized());
     return LookupPath(PathString(
-            path_.ToString() + "/.cvmfsautocatalog"), &dirent);
+            mountpoint_.ToString() + "/.cvmfsautocatalog"), &dirent);
   }
   inline bool HasParent() const { return parent_ != NULL; }
   inline virtual bool IsWritable() const { return false; }
 
   typedef struct {
-    PathString path;
+    PathString mountpoint;
     shash::Any hash;
     uint64_t size;
   } NestedCatalog;
   typedef std::vector<NestedCatalog> NestedCatalogList;
   const NestedCatalogList& ListNestedCatalogs() const;
+  const NestedCatalogList ListOwnNestedCatalogs() const;
   bool FindNested(const PathString &mountpoint,
                   shash::Any *hash, uint64_t *size) const;
 
   void SetInodeAnnotation(InodeAnnotation *new_annotation);
+  inode_t GetMangledInode(const uint64_t row_id,
+                          const uint64_t hardlink_group) const;
+
   void SetOwnerMaps(const OwnerMap *uid_map, const OwnerMap *gid_map);
+  uint64_t MapUid(const uint64_t uid) const {
+    if (uid_map_) { return uid_map_->Map(uid); }
+    return uid;
+  }
+  uint64_t MapGid(const uint64_t gid) const {
+    if (gid_map_) { return gid_map_->Map(gid); }
+    return gid;
+  }
 
  protected:
   typedef std::map<uint64_t, inode_t> HardlinkGroupMap;
   mutable HardlinkGroupMap hardlink_groups_;
+
+  pthread_mutex_t *lock_;
 
   bool InitStandalone(const std::string &database_file);
   bool ReadCatalogCounters();
@@ -231,40 +244,66 @@ class Catalog : public SingleCopy {
   virtual void InitPreparedStatements();
   void FinalizePreparedStatements();
 
-  void AddChild(Catalog *child);
-  void RemoveChild(Catalog *child);
-  CatalogList GetChildren() const;
-  Catalog* FindSubtree(const PathString &path) const;
-  Catalog* FindChild(const PathString &mountpoint) const;
-
-  Counters& GetCounters() { return counters_; }
+  Counters& GetWritableCounters() { return counters_; }
 
   inline const CatalogDatabase &database() const { return *database_; }
   inline       CatalogDatabase &database()       { return *database_; }
   inline void set_parent(Catalog *catalog) { parent_ = catalog; }
 
-  void ResetNestedCatalogCache();
+  void ResetNestedCatalogCacheUnprotected();
 
  private:
   typedef std::map<PathString, Catalog*> NestedCatalogMap;
 
-  uint64_t GetRowIdFromInode(const inode_t inode) const;
-  inode_t GetMangledInode(const uint64_t row_id,
-                          const uint64_t hardlink_group) const;
+  /**
+   * The hash of the empty string.  Used to identify the root entry of a
+   * repository, which is the child transition point of a bind mountpoint.
+   */
+  static const shash::Md5 kMd5PathEmpty;
+
+  enum VomsAuthzStatus {
+    kVomsUnknown,  // Not yet looked up
+    kVomsNone,     // No voms_authz key in properties table
+    kVomsPresent,  // voms_authz property available
+  };
+
+  shash::Md5 NormalizePath(const PathString &path) const;
+  PathString NormalizePath2(const PathString &path) const;
+  PathString PlantPath(const PathString &path) const;
 
   void FixTransitionPoint(const shash::Md5 &md5path,
                           DirectoryEntry *dirent) const;
 
- private:
+  bool LookupMd5Path(const shash::Md5 &md5path, DirectoryEntry *dirent) const;
+  bool LookupXattrsMd5Path(const shash::Md5 &md5path, XattrList *xattrs) const;
+  bool ListMd5PathChunks(const shash::Md5 &md5path,
+                         const shash::Algorithms interpret_hashes_as,
+                         FileChunkList *chunks) const;
+  bool ListingMd5Path(const shash::Md5 &md5path,
+                      DirectoryEntryList *listing,
+                      const bool expand_symlink = true) const;
+  bool ListingMd5PathStat(const shash::Md5 &md5path,
+                          StatEntryList *listing) const;
   bool LookupEntry(const shash::Md5 &md5path, const bool expand_symlink,
                    DirectoryEntry *dirent) const;
+
   CatalogDatabase *database_;
-  pthread_mutex_t *lock_;
 
   const shash::Any catalog_hash_;
   PathString root_prefix_;
-  PathString path_;
+  /**
+   * Normally, catalogs are mounted at their root_prefix_. But for the structure
+   * under /.cvmfs/snapshots/..., that's not the case.
+   */
+  PathString mountpoint_;
+  /**
+   * True, iff root_prefix_ == mountpoint_
+   */
+  bool is_regular_mountpoint_;
   bool volatile_flag_;
+  /**
+   * For catalogs in a catalog manager: doesn't have a parent catalog
+   */
   const bool is_root_;
   bool managed_database_;
 
@@ -272,6 +311,9 @@ class Catalog : public SingleCopy {
   NestedCatalogMap children_;
   mutable NestedCatalogList nested_catalog_cache_;
   mutable bool              nested_catalog_cache_dirty_;
+
+  mutable VomsAuthzStatus voms_authz_status_;
+  mutable std::string voms_authz_;
 
   bool initialized_;
   InodeRange inode_range_;
@@ -282,14 +324,14 @@ class Catalog : public SingleCopy {
   const OwnerMap *uid_map_;
   const OwnerMap *gid_map_;
 
-  SqlListing               *sql_listing_;
-  SqlLookupPathHash        *sql_lookup_md5path_;
-  SqlLookupInode           *sql_lookup_inode_;
-  SqlNestedCatalogLookup   *sql_lookup_nested_;
-  SqlNestedCatalogListing  *sql_list_nested_;
-  SqlAllChunks             *sql_all_chunks_;
-  SqlChunksListing         *sql_chunks_listing_;
-  SqlLookupXattrs          *sql_lookup_xattrs_;
+  SqlListing                  *sql_listing_;
+  SqlLookupPathHash           *sql_lookup_md5path_;
+  SqlNestedCatalogLookup      *sql_lookup_nested_;
+  SqlNestedCatalogListing     *sql_list_nested_;
+  SqlOwnNestedCatalogListing  *sql_own_list_nested_;
+  SqlAllChunks                *sql_all_chunks_;
+  SqlChunksListing            *sql_chunks_listing_;
+  SqlLookupXattrs             *sql_lookup_xattrs_;
 
   mutable HashVector        referenced_hashes_;
 };  // class Catalog

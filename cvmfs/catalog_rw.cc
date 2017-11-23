@@ -11,12 +11,16 @@
 #include <cstdlib>
 
 #include "logging.h"
-#include "util.h"
+#include "util_concurrency.h"
 #include "xattr.h"
 
 using namespace std;  // NOLINT
 
 namespace catalog {
+
+const double WritableCatalog::kMaximalFreePageRatio = 0.20;
+const double WritableCatalog::kMaximalRowIdWasteRatio = 0.25;
+
 
 WritableCatalog::WritableCatalog(const string      &path,
                                  const shash::Any  &catalog_hash,
@@ -35,7 +39,10 @@ WritableCatalog::WritableCatalog(const string      &path,
   sql_chunks_count_(NULL),
   sql_max_link_id_(NULL),
   sql_inc_linkcount_(NULL),
-  dirty_(false) {}
+  dirty_(false)
+{
+  atomic_init32(&dirty_children_);
+}
 
 
 WritableCatalog *WritableCatalog::AttachFreely(const string      &root_path,
@@ -62,19 +69,17 @@ WritableCatalog::~WritableCatalog() {
 
 
 void WritableCatalog::Transaction() {
-  Sql transaction(database(), "BEGIN;");
   LogCvmfs(kLogCatalog, kLogVerboseMsg, "opening SQLite transaction for '%s'",
-                                        path().c_str());
-  bool retval = transaction.Execute();
+                                        mountpoint().c_str());
+  const bool retval = database().BeginTransaction();
   assert(retval == true);
 }
 
 
 void WritableCatalog::Commit() {
-  Sql commit(database(), "COMMIT;");
   LogCvmfs(kLogCatalog, kLogVerboseMsg, "closing SQLite transaction for '%s'",
-                                        path().c_str());
-  bool retval = commit.Execute();
+                                        mountpoint().c_str());
+  const bool retval = database().CommitTransaction();
   assert(retval == true);
   dirty_ = false;
 }
@@ -83,7 +88,7 @@ void WritableCatalog::Commit() {
 void WritableCatalog::InitPreparedStatements() {
   Catalog::InitPreparedStatements();  // polymorphism: up call
 
-  bool retval = Sql(database(), "PRAGMA foreign_keys = ON;").Execute();
+  bool retval = SqlCatalog(database(), "PRAGMA foreign_keys = ON;").Execute();
   assert(retval);
   sql_insert_        = new SqlDirentInsert     (database());
   sql_unlink_        = new SqlDirentUnlink     (database());
@@ -143,7 +148,7 @@ void WritableCatalog::AddEntry(
 
   LogCvmfs(kLogCatalog, kLogVerboseMsg, "add entry '%s' to '%s'",
                                         entry_path.c_str(),
-                                        path().c_str());
+                                        mountpoint().c_str());
 
   shash::Md5 path_hash((shash::AsciiPtr(entry_path)));
   shash::Md5 parent_hash((shash::AsciiPtr(parent_path)));
@@ -176,10 +181,8 @@ void WritableCatalog::AddEntry(
  * @param entry_path the full path of the DirectoryEntry to delete
  */
 void WritableCatalog::RemoveEntry(const string &file_path) {
-  shash::Md5 path_hash = shash::Md5(shash::AsciiPtr(file_path));
-
   DirectoryEntry entry;
-  bool retval = LookupMd5Path(path_hash, &entry);
+  bool retval = LookupPath(PathString(file_path), &entry);
   assert(retval);
 
   SetDirty();
@@ -190,6 +193,7 @@ void WritableCatalog::RemoveEntry(const string &file_path) {
   }
 
   // remove the entry itself
+  shash::Md5 path_hash = shash::Md5(shash::AsciiPtr(file_path));
   retval =
     sql_unlink_->BindPathHash(path_hash) &&
     sql_unlink_->Execute();
@@ -311,6 +315,21 @@ void WritableCatalog::SetRevision(const uint64_t new_revision) {
 }
 
 
+void WritableCatalog::SetBranch(const std::string &branch_name) {
+  database().SetProperty("branch", branch_name);
+}
+
+
+void WritableCatalog::SetTTL(const uint64_t new_ttl) {
+  database().SetProperty("TTL", new_ttl);
+}
+
+
+bool WritableCatalog::SetVOMSAuthz(const std::string &voms_authz) {
+  return database().SetVOMSAuthz(voms_authz);
+}
+
+
 /**
  * Sets the content hash of the previous catalog revision.
  */
@@ -324,7 +343,7 @@ void WritableCatalog::SetPreviousRevision(const shash::Any &hash) {
  */
 void WritableCatalog::Partition(WritableCatalog *new_nested_catalog) {
   // Create connection between parent and child catalogs
-  MakeTransitionPoint(new_nested_catalog->path().ToString());
+  MakeTransitionPoint(new_nested_catalog->mountpoint().ToString());
   new_nested_catalog->MakeNestedRoot();
   delta_counters_.subtree.directories++;  // Root directory in nested catalog
 
@@ -332,7 +351,7 @@ void WritableCatalog::Partition(WritableCatalog *new_nested_catalog) {
   // if we hit nested catalog mountpoints on the way, we return them through
   // the passed list
   vector<string> GrandChildMountpoints;
-  MoveToNested(new_nested_catalog->path().ToString(), new_nested_catalog,
+  MoveToNested(new_nested_catalog->mountpoint().ToString(), new_nested_catalog,
                &GrandChildMountpoints);
 
   // Nested catalog mountpoints found in the moved directory structure are now
@@ -359,13 +378,13 @@ void WritableCatalog::MakeTransitionPoint(const string &mountpoint) {
 
 void WritableCatalog::MakeNestedRoot() {
   DirectoryEntry root_entry;
-  bool retval = LookupPath(path(), &root_entry);
+  bool retval = LookupPath(mountpoint(), &root_entry);
   assert(retval);
 
   assert(root_entry.IsDirectory() && !root_entry.IsNestedCatalogMountpoint());
 
   root_entry.set_is_nested_catalog_root(true);
-  UpdateEntry(root_entry, path().ToString());
+  UpdateEntry(root_entry, mountpoint().ToString());
 }
 
 
@@ -472,8 +491,8 @@ void WritableCatalog::InsertNestedCatalog(const string &mountpoint,
   const string hash_string = (!content_hash.IsNull()) ?
                              content_hash.ToString() : "";
 
-  Sql stmt(database(), "INSERT INTO nested_catalogs (path, sha1, size) "
-                       "VALUES (:p, :sha1, :size);");
+  SqlCatalog stmt(database(), "INSERT INTO nested_catalogs (path, sha1, size) "
+                              "VALUES (:p, :sha1, :size);");
   bool retval =
     stmt.BindText(1, mountpoint) &&
     stmt.BindText(2, hash_string) &&
@@ -486,9 +505,31 @@ void WritableCatalog::InsertNestedCatalog(const string &mountpoint,
   if (attached_reference != NULL)
     AddChild(attached_reference);
 
-  ResetNestedCatalogCache();
+  ResetNestedCatalogCacheUnprotected();
 
   delta_counters_.self.nested_catalogs++;
+}
+
+
+/**
+ * Registeres a snapshot in /.cvmfs/snapshots. Note that bind mountpoints are
+ * not universally handled: in Partition and MergeIntoParent, bind mountpoint
+ * handling is missing!
+ */
+void WritableCatalog::InsertBindMountpoint(
+  const string &mountpoint,
+  const shash::Any content_hash,
+  const uint64_t size)
+{
+  SqlCatalog stmt(database(),
+     "INSERT INTO bind_mountpoints (path, sha1, size) "
+     "VALUES (:p, :sha1, :size);");
+  bool retval =
+     stmt.BindText(1, mountpoint) &&
+     stmt.BindText(2, content_hash.ToString()) &&
+     stmt.BindInt64(3, size) &&
+     stmt.Execute();
+  assert(retval);
 }
 
 
@@ -510,8 +551,8 @@ void WritableCatalog::RemoveNestedCatalog(const string &mountpoint,
                            &dummy, &dummy_size);
   assert(retval);
 
-  Sql stmt(database(),
-           "DELETE FROM nested_catalogs WHERE path = :p;");
+  SqlCatalog stmt(database(),
+                  "DELETE FROM nested_catalogs WHERE path = :p;");
   retval =
     stmt.BindText(1, mountpoint) &&
     stmt.Execute();
@@ -526,25 +567,52 @@ void WritableCatalog::RemoveNestedCatalog(const string &mountpoint,
   if (attached_reference != NULL)
     *attached_reference = child;
 
-  ResetNestedCatalogCache();
+  ResetNestedCatalogCacheUnprotected();
 
   delta_counters_.self.nested_catalogs--;
 }
 
 
 /**
- * Updates the link to a nested catalog in the database.
- * @param path the path of the nested catalog to update
- * @param hash the hash to set the given nested catalog link to
+ * Unregisteres a snapshot from /.cvmfs/snapshots. Note that bind mountpoints
+ * are not universally handled: in Partition and MergeIntoParent, bind
+ * mountpoint handling is missing!
  */
-void WritableCatalog::UpdateNestedCatalog(const string &path,
-                                          const shash::Any &hash,
-                                          const uint64_t size)
-{
+void WritableCatalog::RemoveBindMountpoint(const std::string &mountpoint) {
+  shash::Any dummy;
+  uint64_t dummy_size;
+  bool retval = FindNested(PathString(mountpoint.data(), mountpoint.length()),
+                           &dummy, &dummy_size);
+  assert(retval);
+
+  SqlCatalog stmt(database(),
+                  "DELETE FROM bind_mountpoints WHERE path = :p;");
+  retval =
+    stmt.BindText(1, mountpoint) &&
+    stmt.Execute();
+  assert(retval);
+}
+
+
+/**
+ * Updates the link to a nested catalog in the database.
+ * @param path             the path of the nested catalog to update
+ * @param hash             the hash to set the given nested catalog link to
+ * @param size             the uncompressed catalog database file size
+ * @param child_counters   the statistics counters of the nested catalog
+ */
+void WritableCatalog::UpdateNestedCatalog(const std::string   &path,
+                                          const shash::Any    &hash,
+                                          const uint64_t       size,
+                                          const DeltaCounters &child_counters) {
+  MutexLockGuard guard(lock_);
+
+  child_counters.PopulateToParent(&delta_counters_);
+
   const string hash_str = hash.ToString();
   const string sql = "UPDATE nested_catalogs SET sha1 = :sha1, size = :size  "
-    "WHERE path = :path;";
-  Sql stmt(database(), sql);
+                     "WHERE path = :path;";
+  SqlCatalog stmt(database(), sql);
 
   bool retval =
     stmt.BindText(1, hash_str) &&
@@ -552,7 +620,7 @@ void WritableCatalog::UpdateNestedCatalog(const string &path,
     stmt.BindText(3, path) &&
     stmt.Execute();
 
-  ResetNestedCatalogCache();
+  ResetNestedCatalogCacheUnprotected();
 
   assert(retval);
 }
@@ -569,13 +637,32 @@ void WritableCatalog::MergeIntoParent() {
 
   // Fix counters in parent
   delta_counters_.PopulateToParent(&parent->delta_counters_);
-  Counters &counters = GetCounters();
+  Counters &counters = GetWritableCounters();
   counters.ApplyDelta(delta_counters_);
   counters.MergeIntoParent(&parent->delta_counters_);
 
   // Remove the nested catalog reference for this nested catalog.
   // From now on this catalog will be dangling!
-  parent->RemoveNestedCatalog(this->path().ToString(), NULL);
+  parent->RemoveNestedCatalog(this->mountpoint().ToString(), NULL);
+}
+
+
+void WritableCatalog::RemoveFromParent() {
+  assert(!IsRoot() && HasParent());
+  WritableCatalog *parent = GetWritableParent();
+
+  // Remove the nested catalog reference for this nested catalog.
+  // From now on this catalog will be dangling!
+  Catalog* child_catalog;
+  parent->RemoveNestedCatalog(this->mountpoint().ToString(), &child_catalog);
+
+  const Counters& child_counters = child_catalog->GetCounters();
+
+  parent->delta_counters_.subtree.directories -= 1;
+  parent->delta_counters_.subtree.file_size -= child_counters.self.file_size;
+  parent->delta_counters_.subtree.regular_files -=
+      child_counters.self.regular_files;
+  parent->delta_counters_.subtree.symlinks -= child_counters.self.symlinks;
 }
 
 
@@ -583,7 +670,7 @@ void WritableCatalog::CopyCatalogsToParent() {
   WritableCatalog *parent = GetWritableParent();
 
   // Obtain a list of all nested catalog references
-  const NestedCatalogList &nested_catalog_references = ListNestedCatalogs();
+  const NestedCatalogList nested_catalog_references = ListOwnNestedCatalogs();
 
   // Go through the list and update the databases
   // simultaneously we are checking if the referenced catalogs are currently
@@ -591,8 +678,9 @@ void WritableCatalog::CopyCatalogsToParent() {
   for (NestedCatalogList::const_iterator i = nested_catalog_references.begin(),
        iEnd = nested_catalog_references.end(); i != iEnd; ++i)
   {
-    Catalog *child = FindChild(i->path);
-    parent->InsertNestedCatalog(i->path.ToString(), child, i->hash, i->size);
+    Catalog *child = FindChild(i->mountpoint);
+    parent->InsertNestedCatalog(
+      i->mountpoint.ToString(), child, i->hash, i->size);
     parent->delta_counters_.self.nested_catalogs--;  // Will be fixed later
   }
 }
@@ -617,13 +705,13 @@ void WritableCatalog::CopyToParent() {
     "UPDATE catalog SET hardlinks = hardlinks + " + StringifyInt(offset) +
     " WHERE hardlinks > (1 << 32);";
 
-  Sql sql_update_link_ids(database(), update_link_ids);
+  SqlCatalog sql_update_link_ids(database(), update_link_ids);
   bool retval = sql_update_link_ids.Execute();
   assert(retval);
 
   // Remove the nested catalog root.
   // It is already present in the parent.
-  RemoveEntry(this->path().ToString());
+  RemoveEntry(this->mountpoint().ToString());
 
   // Now copy all DirectoryEntries to the 'other' catalog.
   // There will be no data collisions, as we resolved them beforehand
@@ -631,24 +719,24 @@ void WritableCatalog::CopyToParent() {
     Commit();
   if (parent->dirty_)
     parent->Commit();
-  Sql sql_attach(database(), "ATTACH '" + parent->database_path() +
-                             "' AS other;");
+  SqlCatalog sql_attach(database(), "ATTACH '" + parent->database_path() + "' "
+                                    "AS other;");
   retval = sql_attach.Execute();
   assert(retval);
-  retval = Sql(database(), "INSERT INTO other.catalog "
-                           "SELECT * FROM main.catalog;").Execute();
+  retval = SqlCatalog(database(), "INSERT INTO other.catalog "
+                                  "SELECT * FROM main.catalog;").Execute();
   assert(retval);
-  retval = Sql(database(), "INSERT INTO other.chunks "
-                           "SELECT * FROM main.chunks;").Execute();
+  retval = SqlCatalog(database(), "INSERT INTO other.chunks "
+                                  "SELECT * FROM main.chunks;").Execute();
   assert(retval);
-  retval = Sql(database(), "DETACH other;").Execute();
+  retval = SqlCatalog(database(), "DETACH other;").Execute();
   assert(retval);
   parent->SetDirty();
 
   // Change the just copied nested catalog root to an ordinary directory
   // (the nested catalog is merged into it's parent)
   DirectoryEntry old_root_entry;
-  retval = parent->LookupPath(this->path(), &old_root_entry);
+  retval = parent->LookupPath(this->mountpoint(), &old_root_entry);
   assert(retval);
 
   assert(old_root_entry.IsDirectory() &&
@@ -657,7 +745,7 @@ void WritableCatalog::CopyToParent() {
 
   // Remove the nested catalog root mark
   old_root_entry.set_is_nested_catalog_mountpoint(false);
-  parent->UpdateEntry(old_root_entry, this->path().ToString());
+  parent->UpdateEntry(old_root_entry, this->mountpoint().ToString());
 }
 
 
@@ -692,7 +780,9 @@ void WritableCatalog::VacuumDatabaseIfNecessary() {
   if (needs_defragmentation) {
     LogCvmfs(kLogCatalog, kLogStdout | kLogNoLinebreak,
              "Note: Catalog at %s gets defragmented (%.2f%% %s)... ",
-             (IsRoot()) ? "/" : path().c_str(), ratio * 100.0, reason.c_str());
+             (IsRoot()) ? "/" : mountpoint().c_str(),
+             ratio * 100.0,
+             reason.c_str());
     if (!db.Vacuum()) {
       LogCvmfs(kLogCatalog, kLogStderr, "failed (SQLite: %s)",
                db.GetLastErrorMsg().c_str());

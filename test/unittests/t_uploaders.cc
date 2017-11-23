@@ -4,22 +4,21 @@
 
 #include <gtest/gtest.h>
 
-#include <tbb/atomic.h>
+#include <errno.h>
 #include <unistd.h>
 
-#include <sstream>  // TODO(jblomer): remove me
 #include <string>
 
-#include "../../cvmfs/atomic.h"
-#include "../../cvmfs/file_processing/char_buffer.h"
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/upload_facility.h"
-#include "../../cvmfs/upload_local.h"
-#include "../../cvmfs/upload_s3.h"
-#include "../../cvmfs/upload_spooler_definition.h"
-#include "../../cvmfs/util.h"
+#include "atomic.h"
 #include "c_file_sandbox.h"
+#include "hash.h"
 #include "testutil.h"
+#include "upload_facility.h"
+#include "upload_local.h"
+#include "upload_s3.h"
+#include "upload_spooler_definition.h"
+#include "util/file_guard.h"
+#include "util/string.h"
 
 
 /**
@@ -32,49 +31,46 @@ namespace upload {
 class UploadCallbacks {
  public:
   UploadCallbacks() {
-    simple_upload_invocations            = 0;
-    streamed_upload_complete_invocations = 0;
-    buffer_upload_complete_invocations   = 0;
+    atomic_init32(&simple_upload_invocations);
+    atomic_init32(&streamed_upload_complete_invocations);
+    atomic_init32(&buffer_upload_complete_invocations);
   }
 
   void SimpleUploadClosure(const UploaderResults &results,
                                  UploaderResults  expected) {
     EXPECT_EQ(UploaderResults::kFileUpload,   results.type);
-    EXPECT_EQ(static_cast<CharBuffer*>(NULL), results.buffer);
     EXPECT_EQ(expected.return_code,           results.return_code);
     EXPECT_EQ(expected.local_path,            results.local_path);
-    ++simple_upload_invocations;
+    atomic_inc32(&simple_upload_invocations);
   }
 
   void StreamedUploadComplete(const UploaderResults &results,
                                     int              return_code) {
     EXPECT_EQ(UploaderResults::kChunkCommit,  results.type);
     EXPECT_EQ("",                             results.local_path);
-    EXPECT_EQ(static_cast<CharBuffer*>(NULL), results.buffer);
     EXPECT_EQ(return_code,                    results.return_code);
-    ++streamed_upload_complete_invocations;
+    atomic_inc32(&streamed_upload_complete_invocations);
   }
 
   void BufferUploadComplete(const UploaderResults &results,
                                   UploaderResults  expected) {
     EXPECT_EQ(UploaderResults::kBufferUpload, results.type);
     EXPECT_EQ("",                             results.local_path);
-    EXPECT_EQ(expected.buffer,                results.buffer);
     EXPECT_EQ(expected.return_code,           results.return_code);
-    ++buffer_upload_complete_invocations;
+    atomic_inc32(&buffer_upload_complete_invocations);
   }
 
  public:
-  tbb::atomic<unsigned int> simple_upload_invocations;
-  tbb::atomic<unsigned int> streamed_upload_complete_invocations;
-  tbb::atomic<unsigned int> buffer_upload_complete_invocations;
+  atomic_int32 simple_upload_invocations;
+  atomic_int32 streamed_upload_complete_invocations;
+  atomic_int32 buffer_upload_complete_invocations;
 };
 
 
 template <class UploadersT>
 class T_Uploaders : public FileSandbox {
  private:
-  static const std::string sandbox_path;
+  static const char sandbox_path[];
   static const std::string dest_dir;
   static const std::string tmp_dir;
   std::string repo_alias;
@@ -92,10 +88,11 @@ class T_Uploaders : public FileSandbox {
     shash::Any          content_hash;
   };
 
-  typedef std::vector<CharBuffer*>                       Buffers;
+  typedef std::vector<std::string *>                     Buffers;
   typedef std::vector<std::pair<Buffers, StreamHandle> > BufferStreams;
 
-  T_Uploaders() : FileSandbox(T_Uploaders::sandbox_path), uploader_(NULL) {}
+  T_Uploaders() : FileSandbox(string(T_Uploaders::sandbox_path)),
+                  uploader_(NULL) {}
 
  protected:
   AbstractUploader *uploader_;
@@ -150,8 +147,13 @@ class T_Uploaders : public FileSandbox {
 
     // Wait S3 mockup server to finish
     int stat_loc = 0;
-    wait(&stat_loc);
-    ASSERT_EQ(stat_loc, 0);
+    int retval;
+    do {
+      retval = wait(&stat_loc);
+    } while ((retval == -1) && (errno == EINTR));
+    EXPECT_NE(-1, retval) << "wait returned with errno " << errno;
+    EXPECT_TRUE(WIFEXITED(stat_loc));
+    EXPECT_EQ(0, WEXITSTATUS(stat_loc));
   }
 
 
@@ -172,6 +174,7 @@ class T_Uploaders : public FileSandbox {
 
   SpoolerDefinition GetSpoolerDefinition() const {
     const std::string definition = GetSpoolerDefinition(type<UploadersT>());
+    const bool generate_legacy_bulk_chunks = true;
     const bool use_file_chunking = true;
     const size_t min_chunk_size  = 0;   // chunking does not matter here, we are
     const size_t avg_chunk_size  = 1;   // only testing the upload module.
@@ -179,6 +182,8 @@ class T_Uploaders : public FileSandbox {
 
     return SpoolerDefinition(definition,
                              shash::kSha1,
+                             zlib::kZlibDefault,
+                             generate_legacy_bulk_chunks,
                              use_file_chunking,
                              min_chunk_size,
                              avg_chunk_size,
@@ -214,14 +219,15 @@ class T_Uploaders : public FileSandbox {
     rng.InitSeed(rng_seed);
 
     for (unsigned int i = 0; i < buffer_count; ++i) {
+      // Was previously used with CharBuffer
       const size_t buffer_size  = rng.Next(1024 * 1024) + 10;
       const size_t bytes_to_use = rng.Next(buffer_size) +  5;
 
-      CharBuffer *buffer = new CharBuffer(buffer_size);
+      std::string *buffer = new std::string();
+      buffer->reserve(bytes_to_use);
       for (unsigned int i = 0; i < bytes_to_use; ++i) {
-        *(buffer->ptr() + i) = rng.Next(256);
+        buffer->push_back(rng.Next(256));
       }
-      buffer->SetUsedBytes(bytes_to_use);
 
       result.push_back(buffer);
     }
@@ -231,11 +237,8 @@ class T_Uploaders : public FileSandbox {
 
 
   void FreeBuffers(Buffers *buffers) const {
-    Buffers::iterator       i    = buffers->begin();
-    Buffers::const_iterator iend = buffers->end();
-    for (; i != iend; ++i) {
-      delete (*i);
-    }
+    for (unsigned i = 0; i < buffers->size(); ++i)
+      delete (*buffers)[i];
     buffers->clear();
   }
 
@@ -291,10 +294,8 @@ class T_Uploaders : public FileSandbox {
   void CompareBuffersAndFileContents(const Buffers     &buffers,
                                      const std::string &file_path) const {
     size_t buffers_size = 0;
-    Buffers::const_iterator i    = buffers.begin();
-    Buffers::const_iterator iend = buffers.end();
-    for (; i != iend; ++i) {
-      buffers_size += (*i)->used_bytes();
+    for (unsigned i = 0; i < buffers.size(); ++i) {
+      buffers_size += buffers[i]->length();
     }
     const size_t file_size = GetFileSize(file_path);
     EXPECT_EQ(file_size, buffers_size);
@@ -314,6 +315,8 @@ class T_Uploaders : public FileSandbox {
   }
 
 
+  bool IsS3() const;
+
  private:
   void CreateS3Mockup() {
     int pid = fork();
@@ -322,19 +325,6 @@ class T_Uploaders : public FileSandbox {
       S3MockupServerThread();
       exit(0);
     }
-  }
-
-
-  std::vector<std::string> SplitString(const std::string &str, char delim) {
-    std::vector<std::string> elems;
-    std::stringstream ss(str);
-    std::string item;
-
-    while (std::getline(ss, item, delim)) {
-      elems.push_back(item);
-    }
-
-    return elems;
   }
 
 
@@ -391,12 +381,15 @@ class T_Uploaders : public FileSandbox {
     // Listen incoming connections
     listen_sockfd = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(listen_sockfd, 0);
+    FdGuard fd_guard_listen(listen_sockfd);
     bzero(reinterpret_cast<char *>(&serv_addr), sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
     serv_addr.sin_port = htons(CVMFS_S3_TEST_MOCKUP_SERVER_PORT);
     int on = 1;
-    setsockopt(listen_sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    retval = setsockopt(listen_sockfd, SOL_SOCKET,
+                        SO_REUSEADDR, &on, sizeof(on));
+    ASSERT_EQ(retval, 0);
     retval = bind(listen_sockfd,
                   (struct sockaddr *) &serv_addr,
                   sizeof(serv_addr));
@@ -421,6 +414,7 @@ class T_Uploaders : public FileSandbox {
                              (struct sockaddr *) &cli_addr,
                              &clilen);
       ASSERT_GE(accept_sockfd, 0);
+      FdGuard fd_guard_accept(accept_sockfd);
       bzero(buffer, kReadBufferSize);
 
       // Get header
@@ -457,18 +451,17 @@ class T_Uploaders : public FileSandbox {
         std::string path = T_Uploaders::dest_dir + "/" + req_file;
         file = fopen(path.c_str(), "w");
         ASSERT_TRUE(file != NULL);
+        FileGuard file_guard(file);
         int fid = fileno(file);
         ASSERT_GE(fid, 0);
         int left_to_read = content_length;
         while (left_to_read > 0) {
           int n = read(accept_sockfd, buffer, kReadBufferSize-1);
-          write(fid, buffer, n);
+          EXPECT_EQ(n, write(fid, buffer, n));
           left_to_read -= n;
         }
         retval = fsync(fid);
-        ASSERT_EQ(retval, 0);
-        retval = fclose(file);
-        ASSERT_EQ(retval, 0);
+        EXPECT_EQ(retval, 0);
       }
 
       // Reply to client
@@ -476,7 +469,6 @@ class T_Uploaders : public FileSandbox {
       if (req_type.compare("HEAD") == 0) {
         if (req_file.size() >= 4 &&
             req_file.compare(req_file.size() - 4, 4, "EXIT") == 0) {
-          close(listen_sockfd);
           return;
         }
         if (FileExists(T_Uploaders::dest_dir + "/" + req_file) == false)
@@ -494,9 +486,7 @@ class T_Uploaders : public FileSandbox {
 
       int n = write(accept_sockfd, reply.c_str(), reply.length());
       ASSERT_GE(n, 0);
-      close(accept_sockfd);
     }
-    close(listen_sockfd);
   }
 
 
@@ -523,7 +513,7 @@ class T_Uploaders : public FileSandbox {
         "CVMFS_S3_BUCKET=testbucket\n"
         "CVMFS_S3_MAX_NUMBER_OF_PARALLEL_CONNECTIONS=" +
         StringifyInt(parallel_connections) + "\n"
-        "CVMFS_S3_HOST=localhost\n"
+        "CVMFS_S3_HOST=127.0.0.1\n"
         "CVMFS_S3_PORT=" + StringifyInt(CVMFS_S3_TEST_MOCKUP_SERVER_PORT);
 
     fprintf(s3_conf, "%s\n", conf_str.c_str());
@@ -565,30 +555,38 @@ class T_Uploaders : public FileSandbox {
     ctx.buffer = alloca(ctx.size);
     shash::Init(ctx);
 
-    Buffers::const_iterator i    = buffers.begin();
-    Buffers::const_iterator iend = buffers.end();
-    for (; i != iend; ++i) {
-      CharBuffer *current_buffer = *i;
-      shash::Update(current_buffer->ptr(), current_buffer->used_bytes(), ctx);
+    for (unsigned i = 0; i < buffers.size(); ++i) {
+      shash::Update(reinterpret_cast<const unsigned char *>(buffers[i]->data()),
+                    buffers[i]->length(), ctx);
     }
 
     shash::Final(ctx, hash);
   }
 };
 
+template <typename T>
+bool T_Uploaders<T>::IsS3() const {
+  return false;
+}
+
+template <>
+bool T_Uploaders<S3Uploader>::IsS3() const {
+  return true;
+}
+
 template <class UploadersT>
 atomic_int64 T_Uploaders<UploadersT>::gSeed = 0;
 
 template <class UploadersT>
-const std::string T_Uploaders<UploadersT>::sandbox_path = "./cvmfs_ut_uploader";
+const char T_Uploaders<UploadersT>::sandbox_path[] = "./cvmfs_ut_uploader";
 
 template <class UploadersT>
 const std::string T_Uploaders<UploadersT>::tmp_dir =
-    T_Uploaders::sandbox_path + "/tmp";
+    string(T_Uploaders::sandbox_path) + "/tmp";
 
 template <class UploadersT>
 const std::string T_Uploaders<UploadersT>::dest_dir =
-    T_Uploaders::sandbox_path + "/dest";
+    string(T_Uploaders::sandbox_path) + "/dest";
 
 typedef testing::Types<S3Uploader, LocalUploader> UploadTypes;
 TYPED_TEST_CASE(T_Uploaders, UploadTypes);
@@ -618,7 +616,7 @@ TYPED_TEST(T_Uploaders, SimpleFileUpload) {
 
   this->uploader_->WaitForUpload();
   EXPECT_TRUE(TestFixture::CheckFile(dest_name));
-  EXPECT_EQ(1u, this->delegate_.simple_upload_invocations);
+  EXPECT_EQ(1, atomic_read32(&(this->delegate_.simple_upload_invocations)));
   TestFixture::CompareFileContents(big_file_path,
                                    TestFixture::AbsoluteDestinationPath(
                                        dest_name));
@@ -640,7 +638,7 @@ TYPED_TEST(T_Uploaders, PeekIntoStorage) {
   this->uploader_->WaitForUpload();
 
   EXPECT_TRUE(TestFixture::CheckFile(dest_name));
-  EXPECT_EQ(1u, this->delegate_.simple_upload_invocations);
+  EXPECT_EQ(1, atomic_read32(&(this->delegate_.simple_upload_invocations)));
   TestFixture::CompareFileContents(small_file_path,
                                    TestFixture::AbsoluteDestinationPath(
                                        dest_name));
@@ -668,7 +666,7 @@ TYPED_TEST(T_Uploaders, RemoveFromStorage) {
   this->uploader_->WaitForUpload();
 
   EXPECT_TRUE(TestFixture::CheckFile(dest_name));
-  EXPECT_EQ(1u, this->delegate_.simple_upload_invocations);
+  EXPECT_EQ(1, atomic_read32(&(this->delegate_.simple_upload_invocations)));
   TestFixture::CompareFileContents(small_file_path,
                                    TestFixture::AbsoluteDestinationPath(
                                        dest_name));
@@ -702,7 +700,7 @@ TYPED_TEST(T_Uploaders, UploadEmptyFile) {
   this->uploader_->WaitForUpload();
 
   EXPECT_TRUE(TestFixture::CheckFile(dest_name));
-  EXPECT_EQ(1u, this->delegate_.simple_upload_invocations);
+  EXPECT_EQ(1, atomic_read32(&(this->delegate_.simple_upload_invocations)));
   TestFixture::CompareFileContents(empty_file_path,
                                    TestFixture::AbsoluteDestinationPath(
                                        dest_name));
@@ -725,7 +723,7 @@ TYPED_TEST(T_Uploaders, UploadHugeFileSlow) {
   this->uploader_->WaitForUpload();
 
   EXPECT_TRUE(TestFixture::CheckFile(dest_name));
-  EXPECT_EQ(1u, this->delegate_.simple_upload_invocations);
+  EXPECT_EQ(1, atomic_read32(&(this->delegate_.simple_upload_invocations)));
   TestFixture::CompareFileContents(huge_file_path,
                                    TestFixture::AbsoluteDestinationPath(
                                        dest_name));
@@ -736,14 +734,12 @@ TYPED_TEST(T_Uploaders, UploadHugeFileSlow) {
 
 
 TYPED_TEST(T_Uploaders, UploadManyFilesSlow) {
-  const unsigned int number_of_files = 500;
+  const int number_of_files = 500;
   typedef std::vector<std::pair<std::string, std::string> > Files;
 
   Files files;
-  for (unsigned int i = 0; i < number_of_files; ++i) {
-    std::stringstream ss;
-    ss << "file" << i;
-    const std::string dest_name = ss.str();
+  for (int i = 0; i < number_of_files; ++i) {
+    const std::string dest_name = "file" + StringifyInt(i);
     std::string file;
     switch (i % 3) {
       case 0:
@@ -773,7 +769,8 @@ TYPED_TEST(T_Uploaders, UploadManyFilesSlow) {
   }
   this->uploader_->WaitForUpload();
 
-  EXPECT_EQ(number_of_files, this->delegate_.simple_upload_invocations);
+  EXPECT_EQ(number_of_files,
+            atomic_read32(&(this->delegate_.simple_upload_invocations)));
   for (i = files.begin(); i != iend; ++i) {
     EXPECT_TRUE(TestFixture::CheckFile(i->second));
     TestFixture::CompareFileContents(i->first,
@@ -787,12 +784,14 @@ TYPED_TEST(T_Uploaders, UploadManyFilesSlow) {
 
 
 TYPED_TEST(T_Uploaders, SingleStreamedUpload) {
-  const unsigned int number_of_buffers = 10;
+  const int number_of_buffers = 10;
   typename TestFixture::Buffers buffers =
       TestFixture::MakeRandomizedBuffers(number_of_buffers, 1337);
 
-  EXPECT_EQ(0u, this->delegate_.buffer_upload_complete_invocations);
-  EXPECT_EQ(0u, this->delegate_.streamed_upload_complete_invocations);
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   UploadStreamHandle *handle = this->uploader_->InitStreamedUpload(
       AbstractUploader::MakeClosure(&UploadCallbacks::StreamedUploadComplete,
@@ -800,24 +799,29 @@ TYPED_TEST(T_Uploaders, SingleStreamedUpload) {
                                     0));
   ASSERT_NE(static_cast<UploadStreamHandle*>(NULL), handle);
 
-  EXPECT_EQ(0u, this->delegate_.buffer_upload_complete_invocations);
-  EXPECT_EQ(0u, this->delegate_.streamed_upload_complete_invocations);
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   typename TestFixture::Buffers::const_iterator i    = buffers.begin();
   typename TestFixture::Buffers::const_iterator iend = buffers.end();
   for (; i != iend; ++i) {
-    this->uploader_->ScheduleUpload(handle, *i,
-                                    AbstractUploader::MakeClosure(
-                                        &UploadCallbacks::BufferUploadComplete,
-                                        &this->delegate_,
-                                        UploaderResults(0, *i)));
+    this->uploader_->ScheduleUpload(
+      handle,
+      AbstractUploader::UploadBuffer((*i)->length(),
+                                     const_cast<char *>((*i)->data())),
+      AbstractUploader::MakeClosure(
+        &UploadCallbacks::BufferUploadComplete,
+        &this->delegate_,
+        UploaderResults(UploaderResults::kBufferUpload, 0)));
   }
   this->uploader_->WaitForUpload();
 
   EXPECT_EQ(number_of_buffers,
-            this->delegate_.buffer_upload_complete_invocations);
-  EXPECT_EQ(0u,
-            this->delegate_.streamed_upload_complete_invocations);
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   shash::Any content_hash(shash::kSha1, 'A');
   content_hash.Randomize(42);
@@ -825,9 +829,9 @@ TYPED_TEST(T_Uploaders, SingleStreamedUpload) {
   this->uploader_->WaitForUpload();
 
   EXPECT_EQ(number_of_buffers,
-            this->delegate_.buffer_upload_complete_invocations);
-  EXPECT_EQ(1u,
-            this->delegate_.streamed_upload_complete_invocations);
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
+  EXPECT_EQ(1,
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   const std::string dest = "data/" + content_hash.MakePath();
   EXPECT_TRUE(TestFixture::CheckFile(dest));
@@ -843,15 +847,17 @@ TYPED_TEST(T_Uploaders, SingleStreamedUpload) {
 
 
 TYPED_TEST(T_Uploaders, MultipleStreamedUploadSlow) {
-  const unsigned int  number_of_files        = 100;
-  const unsigned int  max_buffers_per_stream = 15;
+  const int  number_of_files        = 100;
+  const int  max_buffers_per_stream = 15;
   typename TestFixture::BufferStreams streams =
       TestFixture::MakeRandomizedBufferStreams(number_of_files,
                                                max_buffers_per_stream,
                                                42);
 
-  EXPECT_EQ(0u, this->delegate_.buffer_upload_complete_invocations);
-  EXPECT_EQ(0u, this->delegate_.streamed_upload_complete_invocations);
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   typename TestFixture::BufferStreams::iterator       i    = streams.begin();
   typename TestFixture::BufferStreams::const_iterator iend = streams.end();
@@ -864,27 +870,33 @@ TYPED_TEST(T_Uploaders, MultipleStreamedUploadSlow) {
     i->second.handle = handle;
   }
 
-  EXPECT_EQ(0u, this->delegate_.buffer_upload_complete_invocations);
-  EXPECT_EQ(0u, this->delegate_.streamed_upload_complete_invocations);
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
+  EXPECT_EQ(0,
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   // go through the handles and schedule buffers for them in a round robin
   // fashion --> we want to test concurrent streamed upload behaviour
   typename TestFixture::BufferStreams active_streams = streams;
   typename TestFixture::BufferStreams::iterator j    = active_streams.begin();
-  unsigned int number_of_buffers                     = 0;
+  int number_of_buffers                              = 0;
   while (!active_streams.empty()) {
     typename TestFixture::Buffers             &buffers        = j->first;
     const typename TestFixture::StreamHandle  &current_handle = j->second;
 
     if (!buffers.empty()) {
-      CharBuffer *current_buffer = buffers.front();
-      ASSERT_NE(static_cast<CharBuffer*>(NULL), current_buffer);
+      std::string *current_buffer = buffers.front();
+      ASSERT_FALSE(current_buffer->empty());
       ++number_of_buffers;
-      this->uploader_->ScheduleUpload(current_handle.handle, current_buffer,
-                   AbstractUploader::MakeClosure(
-                     &UploadCallbacks::BufferUploadComplete,
-                     &this->delegate_,
-                     UploaderResults(0, buffers.front())));
+      this->uploader_->ScheduleUpload(
+          current_handle.handle,
+          AbstractUploader::UploadBuffer(
+            current_buffer->length(),
+            const_cast<char *>(current_buffer->data())),
+          AbstractUploader::MakeClosure(
+            &UploadCallbacks::BufferUploadComplete,
+            &this->delegate_,
+            UploaderResults(UploaderResults::kBufferUpload, 0)));
       buffers.erase(buffers.begin());
     } else {
       this->uploader_->ScheduleCommit(current_handle.handle,
@@ -896,9 +908,9 @@ TYPED_TEST(T_Uploaders, MultipleStreamedUploadSlow) {
   this->uploader_->WaitForUpload();
 
   EXPECT_EQ(number_of_buffers,
-            this->delegate_.buffer_upload_complete_invocations);
+    atomic_read32(&(this->delegate_.buffer_upload_complete_invocations)));
   EXPECT_EQ(number_of_files,
-            this->delegate_.streamed_upload_complete_invocations);
+    atomic_read32(&(this->delegate_.streamed_upload_complete_invocations)));
 
   typename TestFixture::BufferStreams::const_iterator k    = streams.begin();
   typename TestFixture::BufferStreams::const_iterator kend = streams.end();
@@ -912,6 +924,44 @@ TYPED_TEST(T_Uploaders, MultipleStreamedUploadSlow) {
   }
 
   TestFixture::FreeBufferStreams(&streams);
+}
+
+
+//------------------------------------------------------------------------------
+
+
+TYPED_TEST(T_Uploaders, PlaceBootstrappingShortcut) {
+  if (TestFixture::IsS3()) {
+    SUCCEED();  // TODO(rmeusel): enable this as soon as the feature is
+    return;     //                implemented for the S3Uploader
+  }
+
+  const std::string big_file_path = TestFixture::GetBigFile();
+
+  shash::Any digest(shash::kSha1);
+  ASSERT_TRUE(shash::HashFile(big_file_path, &digest));
+
+  const std::string dest_name = "data/" + digest.MakePath();
+
+  this->uploader_->Upload(big_file_path,
+                          dest_name,
+                          AbstractUploader::MakeClosure(
+                              &UploadCallbacks::SimpleUploadClosure,
+                              &this->delegate_,
+                              UploaderResults(0, big_file_path)));
+
+  this->uploader_->WaitForUpload();
+  EXPECT_TRUE(TestFixture::CheckFile(dest_name));
+
+  EXPECT_EQ(1, atomic_read32(&(this->delegate_.simple_upload_invocations)));
+  TestFixture::CompareFileContents(big_file_path,
+                                   TestFixture::AbsoluteDestinationPath(
+                                       dest_name));
+
+  ASSERT_TRUE(this->uploader_->PlaceBootstrappingShortcut(digest));
+  TestFixture::CompareFileContents(big_file_path,
+                                   TestFixture::AbsoluteDestinationPath(
+                                       digest.MakeAlternativePath()));
 }
 
 }  // namespace upload

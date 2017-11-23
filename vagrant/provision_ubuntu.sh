@@ -9,7 +9,7 @@ apt-get update
 
 # install required packages
 apt-get install -y apache2 attr autofs autotools-dev bash bc cmake coreutils   \
-                   curl debhelper debianutils debootstrap docker.io fuse g++   \
+                   curl debhelper debianutils debootstrap fuse g++             \
                    gawk gcc gdb grep gzip initscripts insserv                  \
                    libapache2-mod-wsgi libattr1-dev libc-bin libc6-dev         \
                    libcap-dev libfuse-dev libfuse2 libssl-dev make openssl     \
@@ -17,10 +17,14 @@ apt-get install -y apache2 attr autofs autotools-dev bash bc cmake coreutils   \
                    python-dev python-lzma sed sqlite3 sudo sysvinit-utils      \
                    unzip uuid uuid-dev yum zlib1g
 
+# Try docker (does not exists for 12.04)
+apt-get install -y docker.io
+
 # install some convenience packages
 apt-get install -y git tig iftop htop jq screen python-unittest2
 
 # install FakeS3 from rubygems
+apt-get install -y ruby
 gem install fakes3
 
 # drop a FakeS3 default configuration for CVMFS server
@@ -38,6 +42,5 @@ fi
 # create CVMFS test user
 if ! id $CVMFS_TEST_USER > /dev/null 2>&1; then
   useradd $CVMFS_TEST_USER
-  usermod -a -G fuse $CVMFS_TEST_USER
   echo "$CVMFS_TEST_USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 fi

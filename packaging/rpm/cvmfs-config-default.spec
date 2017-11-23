@@ -1,11 +1,11 @@
 Summary: CernVM File System Default Configuration and Public Keys
 Name: cvmfs-config-default
-Version: 1.2
-Release: 2
+Version: 1.4
+Release: 1
 Source0: cern.ch.pub
 Source1: cern-it1.cern.ch.pub
-Source2: cern-it2.cern.ch.pub
-Source3: cern-it3.cern.ch.pub
+Source2: cern-it4.cern.ch.pub
+Source3: cern-it5.cern.ch.pub
 Source4: egi.eu.pub
 Source5: opensciencegrid.org.pub
 Source6: cern.ch.conf
@@ -13,9 +13,8 @@ Source7: egi.eu.conf
 Source8: opensciencegrid.org.conf
 Source9: 50-cern.conf
 Source10: 60-egi.conf
-Source11: atlas-nightlies.cern.ch.conf
-Source12: cms.cern.ch.conf
-Source13: grid.cern.ch.conf
+Source11: cms.cern.ch.conf
+Source12: grid.cern.ch.conf
 BuildArch: noarch
 Group: Applications/System
 License: BSD
@@ -56,7 +55,7 @@ done
 for defaultconf in %{SOURCE9} %{SOURCE10}; do
     install -D -m 444 "${defaultconf}" $RPM_BUILD_ROOT%{_sysconfdir}/cvmfs/default.d
 done
-for conf in %{SOURCE11} %{SOURCE12} %{SOURCE13}; do
+for conf in %{SOURCE11} %{SOURCE12}; do
     install -D -m 444 "${conf}" $RPM_BUILD_ROOT%{_sysconfdir}/cvmfs/config.d
 done
 
@@ -75,6 +74,13 @@ done
 %config %{_sysconfdir}/cvmfs/config.d/*
 
 %changelog
+* Thu May 11 2017 Jakob Blomer <jblomer@cern.ch> - 1.4-1
+- Remove dedicated atlas-nightlies.cern.ch Stratum 1
+
+* Wed Jan 18 2017 Jakob Blomer <jblomer@cern.ch> - 1.3-1
+- Update cern.ch master keys
+- Disable ASGC Stratum 1
+
 * Fri May 22 2015 Dave Dykstra <dwd@fnal.gov> - 1.2-2
 - Change Obsoletes/Conflicts on cvmfs-keys and cvmfs-init-scripts to
   Obsoletes/Provides with specific version numbers, according to Fedora

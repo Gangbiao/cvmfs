@@ -2,13 +2,30 @@ import math
 import string
 import re
 import bisect
+import socket
 import cvmfs_api
+import time
+import threading
+import cvmfs_globals
 
-import GeoIP
-
-gi = GeoIP.open("/var/lib/cvmfs-server/geo/GeoLiteCity.dat", GeoIP.GEOIP_STANDARD)
+# TODO(jblomer): we should better sepearate the code that needs the GeoIP
+# dependency from the code that doesn't
+if not cvmfs_globals.CVMFS_UNITTESTS:
+    import GeoIP
+    gi = GeoIP.open("/var/lib/cvmfs-server/geo/GeoLiteCity.dat", GeoIP.GEOIP_STANDARD)
+    gi6 = GeoIP.open("/var/lib/cvmfs-server/geo/GeoLiteCityv6.dat", GeoIP.GEOIP_STANDARD)
 
 positive_expire_secs = 60*60  # 1 hour
+
+geo_cache_secs = 5*60   # 5 minutes
+
+geo_cache_max_entries = 100000  # a ridiculously large but manageable number
+
+# geo_cache entries are indexed by name and contain a tuple of
+# (update time, geo record).  Caching DNS lookups is more important
+# than caching geo information but it's simpler and slightly more
+# efficient to cache the geo information.
+geo_cache = {}
 
 # function came from http://www.johndcook.com/python_longitude_latitude.html
 def distance_on_unit_sphere(lat1, long1, lat2, long2):
@@ -16,34 +33,33 @@ def distance_on_unit_sphere(lat1, long1, lat2, long2):
     if (lat1 == lat2) and (long1 == long2):
         return 0.0
 
-    # Convert latitude and longitude to 
+    # Convert latitude and longitude to
     # spherical coordinates in radians.
     degrees_to_radians = math.pi/180.0
-        
+
     # phi = 90 - latitude
     phi1 = (90.0 - lat1)*degrees_to_radians
     phi2 = (90.0 - lat2)*degrees_to_radians
-        
+
     # theta = longitude
     theta1 = long1*degrees_to_radians
     theta2 = long2*degrees_to_radians
-        
+
     # Compute spherical distance from spherical coordinates.
-        
-    # For two locations in spherical coordinates 
+
+    # For two locations in spherical coordinates
     # (1, theta, phi) and (1, theta, phi)
-    # cosine( arc length ) = 
+    # cosine( arc length ) =
     #    sin phi sin phi' cos(theta-theta') + cos phi cos phi'
     # distance = rho * arc length
-    
-    cos = (math.sin(phi1)*math.sin(phi2)*math.cos(theta1 - theta2) + 
+
+    cos = (math.sin(phi1)*math.sin(phi2)*math.cos(theta1 - theta2) +
            math.cos(phi1)*math.cos(phi2))
     arc = math.acos( cos )
 
-    # Remember to multiply arc by the radius of the earth 
+    # Remember to multiply arc by the radius of the earth
     # in your favorite set of units to get length.
     return arc
-
 
 # Pattern including all allowed characters in addresses.
 # The geoip api functions will further validate, but for paranoia's sake
@@ -52,56 +68,87 @@ def distance_on_unit_sphere(lat1, long1, lat2, long2):
 # Include ':' for IPv6 addresses.
 addr_pattern = re.compile('^[0-9a-zA-Z.:-]*$')
 
-# expected geo api URL:  /cvmfs/<repo_name>/api/v<version>/geo/<path_info>
-#   <repo_name> is repository name
-#   <version> is the api version number, typically "1.0"
-#   <path_info> is <caching_string>/<serverlist>
-#     <caching_string> can be anything to assist in ensuring that those
-#       clients wanting the same answer get responses cached together;
-#       typically the name of their shared proxy
-#     <serverlist> is a comma-separated list of N server names
-# response: a comma-separated list of numbers specifying the order of the N
-#    given servers numbered 1 to N from geographically closest to furthest
-#    away from the requester that initiated the connection (the requester
-#    is typically the proxy)
+# Look up geo info for IPv4 or IPv6 address.
+# Will return None if the address does not exist in the DB.
+def addr_geoinfo(addr):
+    if (len(addr) > 256) or not addr_pattern.search(addr):
+        return None
 
-def api(path_info, repo_name, version, start_response, environ):
-
-    start = string.find(path_info, '/') + 1
-    if (start == 0):
-        return cvmfs_api.bad_request(start_response, 'no slash in geo path')
-
-    servers = string.split(path_info[start:], ",")
-
-    rem_addr = ''
-    if 'HTTP_X_FORWARDED_FOR' in environ:
-        forwarded_for = environ['HTTP_X_FORWARDED_FOR']
-        start = string.rfind(forwarded_for, ' ') + 1
-        if (start == 0):
-            start = string.rfind(forwarded_for, ',') + 1
-        rem_addr = forwarded_for[start:]
+    if addr.find(':') != -1:
+        return gi6.record_by_addr_v6(addr)
     else:
-        if 'REMOTE_ADDR' in environ:
-            rem_addr = environ['REMOTE_ADDR']
+        return gi.record_by_addr(addr)
 
-    if (len(rem_addr) < 256) and addr_pattern.search(rem_addr):
-        gir_rem = gi.record_by_addr(rem_addr)
-    else:
-        gir_rem = None
+# Look up geo info by name.  Try IPv4 first since that DB is
+# better and most servers today are dual stack if they have IPv6.
+# Store results in a cache.  Wsgi is multithreaded so need to lock
+# accesses to the shared cache.
+# Return geo info record or None if none found.
+def name_geoinfo(now, name):
+    global geo_cache
+    if (len(name) > 256) or not addr_pattern.search(name):
+        return None
 
-    if gir_rem is None:
-        return cvmfs_api.bad_request(start_response, 'remote addr not found in database')
+    lock = threading.Lock()
+    lock.acquire()
+    if name in geo_cache:
+        (stamp, gir) = geo_cache[name]
+        if now <= stamp + geo_cache_secs:
+            # still good, use it
+            lock.release()
+            return gir
+        # update the timestamp so only one thread needs to wait
+        #  when a lookup is slow
+        geo_cache[name] = (now, gir)
+    elif len(geo_cache) >= geo_cache_max_entries:
+        # avoid denial of service by removing one random entry
+        #   before we add one
+        geo_cache.popitem()
+    lock.release()
 
-    idx = 1
+    ai = ()
+    try:
+        ai = socket.getaddrinfo(name,80,0,0,socket.IPPROTO_TCP)
+    except:
+        pass
+    gir = None
+    for info in ai:
+        # look for IPv4 address first
+        if info[0] == socket.AF_INET:
+            gir = gi.record_by_addr(info[4][0])
+            break
+    if gir == None:
+        # look for an IPv6 address if no IPv4 record found
+        for info in ai:
+            if info[0] == socket.AF_INET6:
+                gir = gi6.record_by_addr_v6(info[4][0])
+                break
+
+    lock.acquire()
+    if gir == None and name in geo_cache:
+        # reuse expired entry
+        gir = geo_cache[name][1]
+
+    geo_cache[name] = (now, gir)
+    lock.release()
+
+    return gir
+
+# geo-sort list of servers relative to gir_rem
+# return list of [onegood, indexes] where
+#   onegood - a boolean saying whether or not there was at least
+#      one valid looked up geolocation from the servers
+#   indexes - list of numbers specifying the order of the N given servers
+#    servers numbered 0 to N-1 from geographically closest to furthest
+#    away compared to gir_rem
+def geosort_servers(now, gir_rem, servers):
+    idx = 0
     arcs = []
     indexes = []
 
     onegood = False
     for server in servers:
-        if (len(server) < 256) and addr_pattern.search(server):
-            gir_server = gi.record_by_name(server)
-        else:
-            gir_server = None
+        gir_server = name_geoinfo(now, server)
 
         if gir_server is None:
             # put it on the end of the list
@@ -112,17 +159,94 @@ def api(path_info, repo_name, version, start_response, environ):
                                           gir_rem['longitude'],
                                           gir_server['latitude'],
                                           gir_server['longitude'])
+            #print "distance between " + \
+            #    str(gir_rem['latitude']) + ',' + str(gir_rem['longitude']) \
+            #    + " and " + \
+            #    server + ' (' + str(gir_server['latitude']) + ',' + str(gir_server['longitude']) + ')' + \
+            #    " is " + str(arc)
 
         i = bisect.bisect(arcs, arc)
-        arcs[i:i] = [ arc ]
-        indexes[i:i] = [ str(idx) ]
+        arcs[i:i] = [arc]
+        indexes[i:i] = [idx]
         idx += 1
+
+    return [onegood, indexes]
+
+# expected geo api URL:  /cvmfs/<repo_name>/api/v<version>/geo/<path_info>
+#   <repo_name> is repository name
+#   <version> is the api version number, typically "1.0"
+#   <path_info> is <caching_string>/<serverlist>
+#     <caching_string> can be anything to assist in ensuring that those
+#       clients wanting the same answer get responses cached together;
+#       typically the name of their shared proxy.  If this resolves to
+#       a valid IP address, attempt to use that address as the source
+#       IP rather than the address seen by the web server. The reason for
+#       that is so it isn't possible for someone to poison a cache by
+#       using a name for someone else's proxy.
+#     <serverlist> is a comma-separated list of N server names
+# response: a comma-separated list of numbers specifying the order of the N
+#    given servers numbered 1 to N from geographically closest to furthest
+#    away from the requester that initiated the connection (the requester
+#    is typically the proxy)
+
+def api(path_info, repo_name, version, start_response, environ):
+
+    slash = path_info.find('/')
+    if (slash == -1):
+        return cvmfs_api.bad_request(start_response, 'no slash in geo path')
+
+    caching_string = path_info[0:slash]
+    servers = string.split(path_info[slash+1:], ",")
+
+    # TODO(jblomer): Can this be switched to monotonic time?
+    now = int(time.time())
+
+    gir_rem = None
+    if caching_string.find('.'):
+        # might be a FQDN, use it if it resolves to a geo record
+        gir_rem = name_geoinfo(now, caching_string)
+
+    if gir_rem is None:
+        rem_addr = ''
+        if 'HTTP_X_FORWARDED_FOR' in environ:
+            forwarded_for = environ['HTTP_X_FORWARDED_FOR']
+            start = string.rfind(forwarded_for, ' ') + 1
+            if (start == 0):
+                start = string.rfind(forwarded_for, ',') + 1
+            rem_addr = forwarded_for[start:]
+        else:
+            if 'REMOTE_ADDR' in environ:
+                rem_addr = environ['REMOTE_ADDR']
+
+        gir_rem = addr_geoinfo(rem_addr)
+
+    if gir_rem is None:
+        return cvmfs_api.bad_request(start_response, 'remote addr not found in database')
+
+    if '+PXYSEP+' in servers:
+        # first geosort the proxies after the separator and if at least one
+        # is good, sort the hosts before the separator relative to that
+        # proxy rather than the client
+        pxysep = servers.index('+PXYSEP+')
+        onegood, pxyindexes = geosort_servers(now, gir_rem, servers[pxysep+1:])
+        if onegood:
+            gir_pxy = name_geoinfo(now, servers[pxysep+1+pxyindexes[0]])
+            if not gir_pxy is None:
+                gir_rem = gir_pxy
+        onegood, hostindexes = geosort_servers(now, gir_rem, servers[0:pxysep])
+        indexes = hostindexes + list(pxysep+1+i for i in pxyindexes)
+        # Append the index of the separator for backward compatibility,
+        # so the client can always expect the same number of indexes as
+        # the number of elements in the request.
+        indexes.append(pxysep)
+    else:
+        onegood, indexes = geosort_servers(now, gir_rem, servers)
 
     if not onegood:
         # return a bad request only if all the server names were bad
         return cvmfs_api.bad_request(start_response, 'no server addr found in database')
 
-    response_body = string.join(indexes, ',') + '\n'
+    response_body = string.join((str(i+1) for i in indexes), ',') + '\n'
 
     status = '200 OK'
     response_headers = [('Content-Type', 'text/plain'),

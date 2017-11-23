@@ -58,7 +58,7 @@ case $sys_arch in
 
   Darwin )
     fuser="/usr/bin/fuser"
-    fuse_fs_type="osxfusefs"
+    fuse_fs_type="osxfuse"
     ;;
 
   * )
@@ -66,20 +66,28 @@ case $sys_arch in
     exit 1 ;;
 esac
 
+# This list of known parameters will be merged with all CVMFS_... environment
+# variable for cvmfs_config showconfig.  It is useful to keep this list to show
+# in cvmfs_config showconfig which known parameters are _not_ set.
 parm_list="CVMFS_USER CVMFS_NFILES CVMFS_CACHE_BASE CVMFS_CACHE_DIR CVMFS_MOUNT_DIR CVMFS_QUOTA_LIMIT \
           CVMFS_SERVER_URL CVMFS_DEBUGLOG CVMFS_HTTP_PROXY \
           CERNVM_GRID_UI_VERSION CVMFS_SYSLOG_LEVEL CVMFS_SYSLOG_FACILITY CVMFS_TRACEFILE \
           CVMFS_TIMEOUT CVMFS_TIMEOUT_DIRECT CVMFS_PUBLIC_KEY CVMFS_KEYS_DIR \
-          CVMFS_MAX_TTL CVMFS_RELOAD_SOCKETS CVMFS_DEFAULT_DOMAIN \
+          CVMFS_MAX_TTL CVMFS_RELOAD_SOCKETS CVMFS_DEFAULT_DOMAIN CVMFS_OOM_SCORE_ADJ \
           CVMFS_MEMCACHE_SIZE CVMFS_KCACHE_TIMEOUT CVMFS_ROOT_HASH CVMFS_REPOSITORY_TAG CVMFS_REPOSITORY_DATE CVMFS_REPOSITORIES \
           CVMFS_PROXY_RESET_AFTER CVMFS_MAX_RETRIES CVMFS_BACKOFF_INIT CVMFS_BACKOFF_MAX \
           CVMFS_ALIEN_CACHE CVMFS_TRUSTED_CERTS CVMFS_INITIAL_GENERATION \
           CVMFS_CONFIG_REPOSITORY CVMFS_LOW_SPEED_LIMIT CVMFS_FALLBACK_PROXY CVMFS_PROXY_TEMPLATE \
-          CVMFS_FOLLOW_REDIRECTS CVMFS_MAX_IPADDR_PER_PROXY"
+          CVMFS_FOLLOW_REDIRECTS CVMFS_MAX_IPADDR_PER_PROXY CVMFS_ALT_ROOT_PATH \
+          CVMFS_IPFAMILY_PREFER CVMFS_DNS_RETRIES CVMFS_DNS_TIMEOUT \
+          CVMFS_AUTHZ_HELPER CVMFS_AUTHZ_SEARCH_PATH CVMFS_WORKSPACE \
+          CVMFS_EXTERNAL_SERVER_URL CVMFS_EXTERNAL_TIMEOUT CVMFS_EXTERNAL_TIMEOUT_DIRECT \
+          CVMFS_EXTERNAL_HTTP_PROXY CVMFS_EXTERNAL_FALLBACK_PROXY CVMFS_CACHE_PRIMARY"
 switch_list="CVMFS_IGNORE_SIGNATURE CVMFS_STRICT_MOUNT CVMFS_SHARED_CACHE \
           CVMFS_NFS_SOURCE CVMFS_NFS_SHARED CVMFS_CHECK_PERMISSIONS CVMFS_AUTO_UPDATE \
           CVMFS_MOUNT_RW CVMFS_SEND_INFO_HEADER CVMFS_USE_GEOAPI CVMFS_CLAIM_OWNERSHIP \
-          CVMFS_HIDE_MAGIC_XATTRS CVMFS_SYSTEMD_NOKILL CVMFS_SERVER_CACHE_MODE"
+          CVMFS_HIDE_MAGIC_XATTRS CVMFS_SYSTEMD_NOKILL CVMFS_SERVER_CACHE_MODE \
+          CVMFS_CONFIG_REPO_REQUIRED"
 required_list="CVMFS_USER CVMFS_NFILES CVMFS_MOUNT_DIR CVMFS_STRICT_MOUNT CVMFS_RELOAD_SOCKETS \
                CVMFS_QUOTA_LIMIT CVMFS_CACHE_BASE CVMFS_SERVER_URL CVMFS_HTTP_PROXY \
                CVMFS_TIMEOUT CVMFS_TIMEOUT_DIRECT CVMFS_SHARED_CACHE CVMFS_CHECK_PERMISSIONS"
@@ -126,16 +134,23 @@ cvmfs_config_usage() {
  echo "Commands are"
  echo "  setup [nouser] [nocfgmod] [nostart]"
  echo "  chksetup"
- echo "  showconfig [<repository>]"
+ echo "  showconfig [-s(hort output, only non-empty parameters)] [<repository>]"
  echo "  stat [-v | <repository>]"
  echo "  status"
- echo "  probe"
+ echo "  probe [<repository list>]"
+ echo "  fsck [<cvmfs_fsck options>]"
  echo "  reload [-c | <repository>]"
  echo "  umount"
  echo "  wipecache"
+ echo "  killall"
  echo "  bugreport"
 }
 
+has_selinux() {
+  which getenforce > /dev/null 2>&1 && \
+  which semodule   > /dev/null 2>&1 && \
+  getenforce | grep -qi "enforc" || return 1
+}
 
 cvmfs_setup() {
   local nouser
@@ -145,10 +160,7 @@ cvmfs_setup() {
   nocfgmod=0
   nostart=0
 
-  if ! cvmfs_readconfig; then
-    echo "Failed to read CernVM-FS configuration"
-    return 1
-  fi
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
 
   while [ $# -ne 0 ]
   do
@@ -194,25 +206,32 @@ cvmfs_setup() {
   mkdir -p /var/lib/cvmfs
   chown cvmfs:cvmfs /var/lib/cvmfs
 
-  # put workarounds for OS X (>= 10.11) in place (SIP related)
-  if [ x"$sys_arch" = x"Darwin" ] && \
-     compare_versions $(sw_vers -productVersion) -ge "10.11"; then
+  # put workarounds for OS X in place (CernVM-FS poor-man's relocatability)
+  if [ x"$sys_arch" = x"Darwin" ]; then
+    # sweep legacy CernVM-FS installation that was not installed into /usr/local
+    _usrlocal_migrate
+
     # symlink configuration files into /etc
     if [ ! -e /etc/cvmfs           ] && \
        [   -e /usr/local/etc/cvmfs ]; then
       ln -s /usr/local/etc/cvmfs /etc/cvmfs
     fi
 
-    # create a (minimal) file system bundle for `mount -t cvmfs` support
-    # Note: the `mount` utility in OS X 10.11.1 doesn't find the installed mount
-    #       helper in `/usr/local/sbin`. When disabling SIP and symlinking the
-    #       mount helper into `/sbin` it would work. Not sure if that is to be
-    #       considered a bug or a feature...
-    #       Currently the bundle creation below is considered a work around!
     if [ ! -e ${cvmfs_fs_bundle}/mount_cvmfs ] && \
+       [ ! -e /sbin/mount_cvmfs              ] && \
        [   -e /usr/local/sbin/mount_cvmfs ]; then
-      mkdir -p $cvmfs_fs_bundle
-      ln -s /usr/local/sbin/mount_cvmfs ${cvmfs_fs_bundle}/mount_cvmfs
+      if compare_versions $(sw_vers -productVersion) -ge "10.11"; then
+        # create a (minimal) file system bundle for `mount -t cvmfs` support
+        # Note: the `mount` utility in OS X 10.11.1 doesn't find the installed
+        #       mount helper in `/usr/local/sbin`. When disabling SIP and sym-
+        #       linking the mount helper into `/sbin` it would work. Not sure if
+        #       that is to be considered a bug or a feature...
+        #       Currently the bundle creation below is considered a work around!
+        mkdir -p $cvmfs_fs_bundle
+        ln -s /usr/local/sbin/mount_cvmfs ${cvmfs_fs_bundle}/mount_cvmfs
+      else
+        ln -s /usr/local/sbin/mount_cvmfs /sbin/mount_cvmfs
+      fi
     fi
   fi
 
@@ -225,10 +244,6 @@ cvmfs_setup() {
   fi
 
   if [ $nocfgmod -eq 0 ]; then
-    if ! configure_fuse; then
-      echo "Cannot configure fuse!"
-      exit 1
-    fi
     if ! configure_autofs; then
       echo "Cannot configure autofs!"
       exit 1
@@ -253,10 +268,7 @@ cvmfs_chksetup() {
   num_warnings=0
   num_errors=0
 
-  if ! cvmfs_readconfig; then
-    echo "Failed to read CernVM-FS configuration"
-    return 1
-  fi
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
 
   # Check binaries
   local binary
@@ -328,11 +340,15 @@ cvmfs_chksetup() {
       echo "Error: fusermount needs to be a suid binary"
       num_errors=$(($num_errors+1))
     fi
-    if ! runas $CVMFS_USER "$fusermount -V" > /dev/null 2>&1; then
-      echo "Error: failed to run $fusermount as user $CVMFS_USER"
+    if ! runascvmfsuser "$fusermount -V" > /dev/null 2>&1; then
+      echo "Error: failed to run $fusermount as cvmfs user"
       num_errors=$(($num_errors+1))
     fi
   fi
+
+  # saving global mount directory configuration
+  local global_mount_dir
+  global_mount_dir=$CVMFS_MOUNT_DIR
 
   # No autofs integration on OS X
   if [ "$sys_arch" = "Linux" ]; then
@@ -349,8 +365,6 @@ cvmfs_chksetup() {
     fi
     # Check that /etc/auto.cvmfs is referenced in auto.master
     # Check that /etc/auto.cvmfs is executable on Linux
-    local global_mount_dir
-    global_mount_dir=$CVMFS_MOUNT_DIR
     if ! grep -q "^$CVMFS_MOUNT_DIR[[:space:]]\+\(program:\|\)/etc/auto.cvmfs" $AUTOMASTER 2> /dev/null; then
       if ! check_is_on CVMFS_NFS_SOURCE; then
         echo "Warning: CernVM-FS map is not referenced from autofs master map"
@@ -362,6 +376,15 @@ cvmfs_chksetup() {
     if [ ! -x /etc/auto.cvmfs ]; then
       echo "Error: /etc/auto.cvmfs is not executable"
       num_errors=$(($num_errors+1))
+    fi
+
+    # Check autofs' kill mode when systemd managed
+    if [ -e /usr/bin/systemctl ]; then
+      if ! /usr/bin/systemctl show -p KillMode autofs.service | grep -q process;
+      then
+        echo "Warning: autofs kill mode is not 'process', busy CernVM-FS mount points are likely to be forcefully killed when autofs is restarted"
+        num_warnings=$(($num_warnings+1))
+      fi
     fi
   fi
 
@@ -379,17 +402,17 @@ cvmfs_chksetup() {
     fi
   fi
 
-  # Check that /dev/fuse is read/writable from CVMFS_USER
+  # Check that /dev/fuse is read/writable from cvmfs user
   check_dev_fuse
   exit_code=$?
   if [ $exit_code -ne 0 ]; then
     num_errors=$(($num_errors+$exit_code))
   fi
 
-  # Check that /etc/nsswitch.conf is readable from CVMFS_USER
+  # Check that /etc/nsswitch.conf is readable from cvmfs user
   if [ -f /etc/nsswitch.conf ]; then
-    if ! runas $CVMFS_USER "test -r /etc/nsswitch.conf"; then
-      echo "Error: /etc/nsswitch not readable by user $CVMFS_USER"
+    if ! runascvmfsuser "test -r /etc/nsswitch.conf"; then
+      echo "Error: /etc/nsswitch not readable by cvmfs user"
       num_errors=$(($num_errors+1))
     fi
   fi
@@ -402,16 +425,8 @@ cvmfs_chksetup() {
     fi
   fi
 
-  # Check fuse configuration
-  if [ "$CVMFS_USER" != "root" ]; then
-    if ! check_fuse_config; then
-      echo "Error: user_allow_other not set in /etc/fuse.conf"
-      num_errors=$(($num_errors+1))
-    fi
-  fi
-
   # Check SELinux label of cache directory
-  if [ -f /selinux/enforce ] && [ $(cat /selinux/enforce) -ne 0 ]; then
+  if has_selinux && semodule --list-modules 2> /dev/null | grep -q cvmfs; then
     local expected_label="cvmfs_cache_t"
     local cache_ctx="$(stat --format='%C' $CVMFS_CACHE_BASE)"
     if [ $? -ne 0 ]; then
@@ -426,9 +441,22 @@ cvmfs_chksetup() {
     fi
   fi
 
+  # Check CVMFS_CONFIG_REPOSITORY not set in late config files
+  for conf_file in /etc/cvmfs/default.local \
+    $(find /etc/cvmfs/domain.d -name '*.conf') \
+    $(find /etc/cvmfs/domain.d -name '*.local') \
+    $(find /etc/cvmfs/config.d -name '*.conf') \
+    $(find /etc/cvmfs/config.d -name '*.local'); do
+    if [ -f $conf_file ]; then
+      if grep -q ^CVMFS_CONFIG_REPOSITORY= $conf_file; then
+        echo "Error: CVMFS_CONFIG_REPOSITORY can only be set in /etc/cvmfs/default.conf and /etc/cvmfs/default.d/*.conf (not in $conf_file)"
+        num_errors=$(($num_errors+1))
+      fi
+    fi
+  done
+
   # Check repository specfic settings
-  local repo_list
-  repo_list=`echo $CVMFS_REPOSITORIES | sed 's/,/ /g'`
+  local repo_list="$(list_repos)"
   local repo
   for repo in $repo_list
   do
@@ -443,7 +471,7 @@ cvmfs_chksetup() {
       echo "Error: failed to read configuration for $fqrn"
       num_errors=$(($num_errors+1))
     else
-      # Check that cache directories are read-writable by CVMFS_USER
+      # Check that cache directories are read-writable by cvmfs user
       local cache_dir
       if check_is_on CVMFS_SHARED_CACHE; then
         cache_dir="$CVMFS_CACHE_BASE/shared"
@@ -451,39 +479,41 @@ cvmfs_chksetup() {
         cache_dir="$CVMFS_CACHE_BASE/$fqrn"
       fi
       if [ -d $cache_dir ]; then
-        if ! runas $CVMFS_USER "test -O $cache_dir"; then
-          echo "Error: $cache_dir is not owned by $CVMFS_USER"
+        if ! runascvmfsuser "test -O $cache_dir"; then
+          echo "Error: $cache_dir is not owned by cvmfs user"
           num_errors=$(($num_errors+1))
         fi
-        if ! runas $CVMFS_USER "test -r $cache_dir"; then
-          echo "Error: $cache_dir is not readable by $CVMFS_USER"
+        if ! runascvmfsuser "test -r $cache_dir"; then
+          echo "Error: $cache_dir is not readable by cvmfs user"
           num_errors=$(($num_errors+1))
         fi
-        if ! runas $CVMFS_USER "test -w $cache_dir"; then
-          echo "Error: $cache_dir is not writable by $CVMFS_USER"
+        if ! runascvmfsuser "test -w $cache_dir"; then
+          echo "Error: $cache_dir is not writable by cvmfs user"
           num_errors=$(($num_errors+1))
         fi
-        if [ "x$CVMFS_ALIEN_CACHE" != "x" ]; then
-          for i in {0..255}
-            do
-              local chunk_dir; chunk_dir="${CVMFS_ALIEN_CACHE}/`printf \"%.2x\n\" $i`"
-                if [ ! -d $chunk_dir ]; then
-                  echo "Error: chunk directory $chunk_dir missing in alien cache."
-                  num_errors=$(($num_errors+1))
-                fi
-            done
-        else
-          if [ "$(ls -A $cache_dir)" ]; then
+        if  [ "x$CVMFS_CACHE_PRIMARY" = "x" -o  "x$CVMFS_CACHE_PRIMARY" = "xposix" ]; then
+          if [ "x$CVMFS_ALIEN_CACHE" != "x" ]; then
             for i in {0..255}
               do
-                local chunk_dir; chunk_dir="$cache_dir/`printf \"%.2x\n\" $i`"
+                local chunk_dir; chunk_dir="${CVMFS_ALIEN_CACHE}/`printf   \"%.2x\n\" $i`"
                   if [ ! -d $chunk_dir ]; then
-                    echo "Error: chunk directory $chunk_dir missing.  Is tmpwatch interfering?"
+                    echo "Error: chunk directory $chunk_dir missing in alien   cache."
                     num_errors=$(($num_errors+1))
                   fi
               done
+          else
+            if [ "$(ls -A $cache_dir)" ]; then
+              for i in {0..255}
+                do
+                  local chunk_dir; chunk_dir="$cache_dir/`printf \"%.2x\n\" $i`"
+                    if [ ! -d $chunk_dir ]; then
+                      echo "Error: chunk directory $chunk_dir missing.  Is   tmpwatch interfering?"
+                      num_errors=$(($num_errors+1))
+                    fi
+                done
+            fi
           fi
-        fi
+        fi  # POSIX cache
       fi
 
       # Check readability of config files
@@ -493,8 +523,8 @@ cvmfs_chksetup() {
                          /etc/cvmfs/config.d/*.conf /etc/cvmfs/config.d/*.local
       do
         if [ -f $config_file ]; then
-          if ! runas $CVMFS_USER "test -r $config_file"; then
-            echo "Error: $config_file is not readable by $CVMFS_USER"
+          if ! runascvmfsuser "test -r $config_file"; then
+            echo "Error: $config_file is not readable by cvmfs user"
             num_errors=$(($num_errors+1))
           fi
         fi
@@ -505,13 +535,13 @@ cvmfs_chksetup() {
       if [ ! -z $HOST_ALIASES ]; then
         host_file="$HOST_ALIASES"
       fi
-      if ! runas $CVMFS_USER "test -r $host_file"; then
-        echo "Error: $host_file is not readable by $CVMFS_USER"
+      if ! runascvmfsuser "test -r $host_file"; then
+        echo "Error: $host_file is not readable by cvmfs user"
         num_errors=$(($num_errors+1))
       fi
 
       # Check that number of open files is reasonably high
-      if [ $CVMFS_NFILES -lt 8192 ]; then
+      if [ ${CVMFS_NFILES:-0} -lt 8192 ]; then
         echo "Warning: maximum number of open files is low ($CVMFS_NFILES) for $fqrn"
         num_warnings=$(($num_warnings+1))
       fi
@@ -543,8 +573,8 @@ cvmfs_chksetup() {
       fi
 
       # Check quota limit
-      if [ $CVMFS_QUOTA_LIMIT -ne -1 ]; then
-        if [ $CVMFS_QUOTA_LIMIT -lt 1000 ]; then
+      if [ ${CVMFS_QUOTA_LIMIT:-0} -ne -1 ]; then
+        if [ ${CVMFS_QUOTA_LIMIT:-0} -lt 1000 ]; then
           echo "Warning: cache limit for $fqrn is very low (below 1GB)"
           num_warnings=$(($num_warnings+1))
         fi
@@ -568,18 +598,18 @@ cvmfs_chksetup() {
       fi
 
       # Compare quota limit with available space on the file system hosting the cache
-      if [ $CVMFS_QUOTA_LIMIT -ge 0 ]; then
+      if [ ${CVMFS_QUOTA_LIMIT:-0} -ge 0 ]; then
         local cache_dir_parent="$cache_dir"
         while [ ! -d "$cache_dir_parent" ]; do
           cache_dir_parent=$(dirname "$cache_dir_parent")
         done
         local total_kb=$(df -Pk "$cache_dir_parent" | tail -n 1 | awk '{print $2}')
         local total_mb=$(($total_kb/1024))
-        if [ $CVMFS_QUOTA_LIMIT -gt $total_mb ]; then
+        if [ ${CVMFS_QUOTA_LIMIT:-0} -gt $total_mb ]; then
           echo "Error: file system hosting the cache for $fqrn too small (quota: ${CVMFS_QUOTA_LIMIT}M, total space: ${total_mb}M)."
           num_errors=$(($num_errors+1))
         fi
-        if [ $(($CVMFS_QUOTA_LIMIT*115/100)) -gt $total_mb ]; then
+        if [ $((${CVMFS_QUOTA_LIMIT:-0}*115/100)) -gt $total_mb ]; then
           echo "Warning: less than 15% safety margin on file system hosting the cache for $fqrn (quota: ${CVMFS_QUOTA_LIMIT}M, total space: ${total_mb}M)."
           num_warnings=$(($num_warnings+1))
         fi
@@ -602,16 +632,6 @@ cvmfs_chksetup() {
           fi
         fi
       done
-
-      # Check that autofs is not active when NFS export is
-      if [ "$sys_arch" = "Linux" ]; then
-        if check_is_on CVMFS_NFS_SOURCE; then
-          if cat /proc/mounts | grep -q "^/etc/auto.cvmfs /cvmfs "; then
-            echo "Error: autofs and NFS export are mutually exclusive ($fqrn)"
-            num_errors=$(($num_errors+1))
-          fi
-        fi
-      fi
 
       if [ ! -z "$CVMFS_NFS_SHARED" ]; then
         if ! check_is_on CVMFS_NFS_SOURCE; then
@@ -686,6 +706,11 @@ cvmfs_chksetup() {
               proxy="$auto_proxy"
             fi
             if [ "x$proxy" != "xDIRECT" ]; then
+              if echo "$proxy" | grep -q -v ^http; then
+                echo "Warning: $proxy does not start with http(s)://"
+                num_warnings=$(($num_warnings+1))
+                continue
+              fi
               proxy_param="env http_proxy=$proxy"
               timeout=$CVMFS_TIMEOUT
             else
@@ -732,34 +757,52 @@ cvmfs_showconfig() {
   local fqrn
   local org
   local retval
+  local short_output=0
+  local short_opt=
   org=$1
+  if [ "x$org" = "x-s" ]; then
+    short_output=1
+    short_opt="-s "
+    shift 1
+    org=$1
+  fi
 
-  cvmfs_readconfig
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
   if [ -z "$org" ]; then
-    list=`echo $CVMFS_REPOSITORIES | sed 's/,/ /g'`
+    list="$(list_repos)"
     for entry in $list
     do
       echo
-      echo "Running $0 $entry:"
-      cvmfs_showconfig $entry
+      echo "Running $0 $short_opt$entry:"
+      cvmfs_showconfig $short_opt$entry
     done
     return 0
   fi
 
   fqrn=`cvmfs_mkfqrn $org`
   org=`cvmfs_getorg $fqrn`
-  cvmfs_readconfig $fqrn
+  cvmfs_readconfig $fqrn || die "Failed to read CernVM-FS configuration"
   retval=$?
   if [ $retval -ne 0 ]; then
     return $retval
   fi
 
+  local setting=
+  local all_vars=
+  while read setting; do
+    [ "x${setting:0:6}" != "xCVMFS_" ] && continue
+    var=$(echo "$setting" | cut -d= -f1)
+    all_vars="$all_vars $var"
+  done <<< "$CVMFS_PARMS"
+  all_vars="$(echo $all_vars $var_list | tr ' ' '\n' | sort -u)"
+
   echo "CVMFS_REPOSITORY_NAME=$fqrn"
-  local var
-  for var in $var_list
-  do
+  local var=
+  while read var; do
     if [ "x$var" = "xCVMFS_CACHE_DIR" ]; then
-      echo "CVMFS_CACHE_DIR=$CVMFS_CACHE_DIR"
+      if [ ! -z "$CVMFS_CACHE_DIR" -o $short_output -eq 0 ]; then
+        echo "CVMFS_CACHE_DIR=$CVMFS_CACHE_DIR"
+      fi
       continue
     fi
     line=$(echo "$CVMFS_PARMS" | grep "^${var}=")
@@ -772,9 +815,9 @@ cvmfs_showconfig() {
       fi
       echo "$line"
     else
-      echo "${var}="
+      [ $short_output -eq 0 ] && echo "${var}="
     fi
-  done
+  done <<< "$all_vars"
 }
 
 
@@ -809,7 +852,7 @@ cvmfs_stat() {
     return 0
   fi
 
-  cvmfs_readconfig
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
   fqrn=`cvmfs_mkfqrn $org`
   org=`cvmfs_getorg $fqrn`
   local active=0
@@ -915,41 +958,19 @@ cvmfs_status() {
 
 
 cvmfs_reload() {
-  if ! cvmfs_readconfig; then
-    echo "Failed to read CernVM-FS configuration"
-    return 1
+  # Run the reload command with clean environment to remove potential cvmfs
+  # dependencies
+  if [ "x$__CVMFS_CLEAN_ENV__" = "x" ]; then
+    exec env -i __CVMFS_CLEAN_ENV__=1 $(get_minimal_path) $0 reload $@
   fi
+
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
   local clean_cache; clean_cache=0
   local cache_directories=
   if [ "x$1" = "x-c" ]; then
     clean_cache=1
     shift
-    local list
-    list=""
-    if [ "x$CVMFS_REPOSITORIES" != "x" ]; then
-       list=`echo $CVMFS_REPOSITORIES | sed 's/,/ /g'`
-    fi
-    local org shared
-    for org in $list shared
-    do
-      case $org in
-        none)
-        ;;
-        *)
-          . /etc/cvmfs/config.sh # start with fresh repository_... functions
-          cvmfs_readconfig
-          if [ "$org" != "shared" ]; then
-            fqrn=`cvmfs_mkfqrn $org`
-            cvmfs_readconfig $fqrn
-          else
-            fqrn=shared
-          fi
-          cache_directories="${CVMFS_CACHE_BASE}/${fqrn} $cache_directories"
-        ;;
-      esac
-    done
-    . /etc/cvmfs/config.sh # start with fresh repository_... functions
-    cvmfs_readconfig
+    cache_directories=$(list_cache_directories)
   elif [ "x$1" != "x" ]; then
     org=$1
     fqrn=$(cvmfs_mkfqrn $org)
@@ -973,6 +994,11 @@ cvmfs_reload() {
     # Ensure that we capture the config repository as well
     cd "${CVMFS_MOUNT_DIR}/${CVMFS_CONFIG_REPOSITORY}" 2>/dev/null
   fi
+  # TODO(jblomer): here is a pretty big race: fuse clients could have passed
+  # the check for this directory in their mount helper but are not yet fully
+  # mounted.  This in result can lead to old quota manager staying alive during
+  # a reload.  Need to be fixed with the overhaul of the fuse client's
+  # initialization code.
   mkdir "$CVMFS_RELOAD_SOCKETS/cvmfs.pause" 2>/dev/null
   if [ $? -ne 0 ]; then
     echo "Another reload process has not finished yet"
@@ -987,7 +1013,7 @@ cvmfs_reload() {
   # can be remounted
   for m in $mount_list
   do
-    touch ${CVMFS_RELOAD_SOCKETS}/cvmfs.pause/$(echo -n "$m" | base64 -w0)
+    touch ${CVMFS_RELOAD_SOCKETS}/cvmfs.pause/$(echo -n "$m" | base64_nowrap)
   done
 
   # Avoid deadlock if cwd is on cvmfs
@@ -1007,7 +1033,7 @@ cvmfs_reload() {
       continue
     fi
     echo "Pausing ${fqrn} on ${m}"
-    cd "$m" && rm -f ${CVMFS_RELOAD_SOCKETS}/cvmfs.pause/$(echo -n "$m" | base64 -w0) && cvmfs2 __RELOAD__ ${CVMFS_RELOAD_SOCKETS}/cvmfs.$fqrn stop_and_go | \
+    cd "$m" && rm -f ${CVMFS_RELOAD_SOCKETS}/cvmfs.pause/$(echo -n "$m" | base64_nowrap) && cvmfs2 __RELOAD__ ${CVMFS_RELOAD_SOCKETS}/cvmfs.$fqrn stop_and_go | \
       awk -v PREFIX="$fqrn: " '{print PREFIX $0}' &
     cd /
     echo $pid > ${CVMFS_RELOAD_SOCKETS}/pid.cvmfs.${fqrn}.paused
@@ -1032,14 +1058,19 @@ cvmfs_reload() {
     for dir in $cache_directories; do
       echo -n "Wiping out $dir ... "
       if [ -d "$dir" ]; then
-        rm -rf "$dir" && \
-          mkdir -p "$dir" && \
-          chown $CVMFS_USER "$dir"
-        if [ $? -ne 0 ]; then
-          echo "Failed!"
-          RETVAL=1
+        local num_nfs_maps=$(find $dir -maxdepth 1 -type d -name 'nfs_maps.*' | wc -l)
+        if [ $num_nfs_maps -ne 0 ]; then
+          echo "not supported for NFS exported client, leaving directory untouched!"
         else
-          echo "OK"
+          rm -rf "$dir" && \
+            mkdir -p "$dir" && \
+            chown $CVMFS_USER "$dir"
+          if [ $? -ne 0 ]; then
+            echo "Failed!"
+            RETVAL=1
+          else
+            echo "OK"
+          fi
         fi
       else
         echo "OK"
@@ -1049,7 +1080,7 @@ cvmfs_reload() {
 
   if stat ${CVMFS_RELOAD_SOCKETS}/pid.* >/dev/null 2>&1; then
     if [ "x$CVMFS_CONFIG_REPOSITORY" != "x" ]; then
-      touch ${CVMFS_RELOAD_SOCKETS}/cvmfs.pause/$(echo -n "${CVMFS_MOUNT_DIR}/${CVMFS_CONFIG_REPOSITORY}" | base64 -w0)
+      touch ${CVMFS_RELOAD_SOCKETS}/cvmfs.pause/$(echo -n "${CVMFS_MOUNT_DIR}/${CVMFS_CONFIG_REPOSITORY}" | base64_nowrap)
     fi
     for pidfile in ${CVMFS_RELOAD_SOCKETS}/pid.*; do
       kill -s USR1 $(cat $pidfile)
@@ -1063,15 +1094,13 @@ cvmfs_reload() {
 
 cvmfs_probe() {
   RETVAL=0
-  local list
-  list=""
 
-  if ! cvmfs_readconfig; then
-    echo "Failed to read CernVM-FS configuration"
-    return 1
-  fi
-  if [ "x$CVMFS_REPOSITORIES" != "x" ]; then
-    list=`echo $CVMFS_REPOSITORIES | sed 's/,/ /g'`
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
+  local list
+  if [ $# -gt 0 ]; then
+    list="$@"
+  else
+    list="$(list_repos)"
   fi
 
   local org
@@ -1082,9 +1111,9 @@ cvmfs_probe() {
       ;;
       *)
         . /etc/cvmfs/config.sh # start with fresh repository_... functions
-        cvmfs_readconfig
+        cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
         fqrn=`cvmfs_mkfqrn $org`
-        cvmfs_readconfig $fqrn
+        cvmfs_readconfig $fqrn || die "Failed to read CernVM-FS configuration"
         echo -n "Probing $CVMFS_MOUNT_DIR/$fqrn... "
         df -P "$CVMFS_MOUNT_DIR/$fqrn" 2>&1 | grep -q ^cvmfs2
         if [ $? -ne 0 ]; then
@@ -1100,8 +1129,28 @@ cvmfs_probe() {
   return $RETVAL
 }
 
+cvmfs_config_fsck() {
+  local retval=0
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
+  local cache_directories=$(list_cache_directories)
+
+  local dir
+  for dir in $cache_directories; do
+    if [ ! -d $dir ]; then
+      continue
+    fi
+
+    echo "CernVM-FS fsck on $dir"
+    cvmfs_fsck $@ $dir
+    retval=$(($? + $retval))
+  done
+
+  return $retval
+}
+
 
 cvmfs_umount() {
+  local silent=$1
   local mount_list
   mount_list=`list_mounts | awk '{print $3}'`
 
@@ -1110,18 +1159,74 @@ cvmfs_umount() {
   local m
   for m in $mount_list
   do
-    echo -n "Unmounting ${m}: "
+    [ "x$silent" != "x" ] || echo -n "Unmounting ${m}: "
     umount $m 2>/dev/null
     if [ $? -ne 0 ]; then
       RETVAL=1
-      echo "Failed!"
-      $fuser -m -a -v $m
+      if [ "x$silent" = "x" ]; then
+        echo "Failed!"
+        $fuser -m -a -v $m
+      fi
     else
-      echo "OK"
+      [ "x$silent" != "x" ] || echo "OK"
     fi
   done
 
   return $RETVAL
+}
+
+
+cvmfs_killall() {
+  local pid=$$
+
+  echo -n "Terminating cvmfs_config processes... "
+  local config_pids=$(pgrep -x cvmfs_config)
+  other_config_pids=
+  for p in $config_pids; do
+    if [ $p -ne $pid ]; then
+      other_config_pids="$p $other_config_pids"
+    fi
+  done
+  if [ "x$other_config_pids" != "x" ]; then
+    kill -s KILL $other_config_pids
+    waitfor cvmfs_config 10
+    if [ $? -ne 0 ]; then
+      echo "Failed!"
+      return 1
+    fi
+  fi
+  echo "OK"
+
+  echo -n "Terminating cvmfs2 processes... "
+  # killall doesn't work because the cvmfs2 binary might have been replaced
+  pkill -SIGKILL -f ${INSTALL_BASE}/bin/cvmfs2 >/dev/null 2>&1
+  waitfor cvmfs2 10 ${INSTALL_BASE}/bin/cvmfs2
+  if [ $? -ne 0 ]; then
+    echo "Failed!"
+    return 1
+  fi
+  echo "OK"
+
+  echo -n "Unmounting stale mount points... "
+  cvmfs_umount silent
+  if [ $? -ne 0 ]; then
+    echo "Failed!"
+    return 1
+  fi
+  echo "OK"
+
+  echo -n "Cleaning up run-time variable data... "
+  rm -rf /var/run/cvmfs/*
+  echo "OK"
+
+  $pidof automount > /dev/null
+  if [ $? -eq 0 ]; then
+    echo -n "Reloading autofs... "
+    reload_service autofs
+    echo "OK"
+  fi
+
+  return 0
 }
 
 
@@ -1165,8 +1270,9 @@ cvmfs_bugreport() {
   case $sys_arch in
     Linux )
       commands=( 'uname -a' 'cat /etc/issue' 'hostname -f' 'ifconfig -a' 'cvmfs2 --version' \
-                 'ls -lR /var/run/cvmfs' 'grep cvmfs2 /var/log/messages' 'grep cvmfs2 /var/log/syslog' \
+                 'ls -lR /var/run/cvmfs' 'grep cvmfs /var/log/messages' 'grep cvmfs /var/log/syslog' \
                  'journalctl -alm /usr/bin/cvmfs2' \
+                 'journalctl -alm /usr/libexec/cvmfs/cache/cvmfs_cache_ram' \
                  "eval find ${CVMFS_CACHE_BASE} -maxdepth 1 -exec ls -lah \{\} \;" \
                  'cvmfs_config probe' 'mount' 'df -h' 'ps -ef' \
                  'cvmfs_config status' 'cvmfs_config showconfig' \
@@ -1175,17 +1281,19 @@ cvmfs_bugreport() {
                  'cat /etc/auto.master' 'cat /etc/autofs/auto.master' 'cat /etc/sysconfig/autofs' \
                  'cat /etc/default/autofs' 'cat /etc/conf.d/autofs' 'journalctl -almu autofs.service' \
                  'cat /etc/fstab' 'cat /etc/exports' 'cat /proc/mounts' 'cat /proc/cpuinfo' \
-                 'cat /etc/hosts' 'free -m' )
+                 'cat /etc/hosts' 'free -m' 'systemctl show autofs.service' \
+                 'id cvmfs' 'ls -la /etc/auto.master.d/*' 'cat /etc/auto.master.d/*')
       ;;
 
     Darwin )
       commands=( 'uname -a' 'sw_vers' 'hostname -f' 'ifconfig -a' 'cvmfs2 --version' \
-                 'ls -lR /var/run/cvmfs' 'grep cvmfs2 /var/log/system.log' 'grep cvmfs2 /var/log/kernel.log' \
-                  "eval find ${CVMFS_CACHE_BASE} -maxdepth 1 -exec ls -lah \{\} \;" \
-                  'cvmfs_config probe' 'cvmfs_config status' 'cvmfs_talk internal affairs' \
-                  'mount' 'df -h' 'ps -ef' 'cvmfs_config showconfig' 'cvmfs_config chksetup' \
-                  'cvmfs_config stat -v' 'cat /etc/fuse.conf' \
-                  'cat /etc/auto_master' 'sysctl vfs.autofs' 'cat /etc/exports' 'cat /etc/hosts' )
+                 'ls -lR /var/run/cvmfs' 'grep cvmfs /var/log/system.log' 'grep cvmfs /var/log/kernel.log' \
+                 "eval find ${CVMFS_CACHE_BASE} -maxdepth 1 -exec ls -lah \{\} \;" \
+                 'cvmfs_config probe' 'cvmfs_config status' 'cvmfs_talk internal affairs' \
+                 'mount' 'df -h' 'ps -ef' 'cvmfs_config showconfig' 'cvmfs_config chksetup' \
+                 'cvmfs_config stat -v' 'cat /etc/fuse.conf' \
+                 'cat /etc/auto_master' 'sysctl vfs.autofs' 'cat /etc/exports' 'cat /etc/hosts' \
+                 'id cvmfs' 'syslog | grep cvmfs' )
       ;;
 
     * )
@@ -1213,8 +1321,96 @@ cvmfs_bugreport() {
 }
 
 
+die() {
+  echo -e $1 >&2
+  exit 1
+}
+
+
+waitfor() {
+  local process=$1
+  local timeout=$2
+  local fullpath="$3"
+  local pid=$$
+
+  local seconds=0
+  while [ $seconds -lt $timeout ]; do
+    local procs=$(pgrep -x $process)
+    local num_other_procs=0
+    for p in $procs; do
+      # Not myself
+      if [ $p -eq $pid ]; then
+        continue;
+      fi
+      # No zombies
+      local pstate=$(ps -p "$p" -o state=)
+      if echo "$pstate" | grep -q "Z"; then
+        continue
+      fi
+      # Only the processes started from the right location
+      if [ "x$fullpath" != "x" ]; then
+        local cmdline=$(ps -p "$p" -o command=)
+        if echo "$cmdline" | grep -v -q "^$fullpath"; then
+          continue
+        fi
+      fi
+      # Not the CernVM instance of cvmfs
+      case $sys_arch in
+        Linux )
+          if [ "x$(cat /proc/$p/cmdline 2>/dev/null | head -c1)" = "x@" ]; then
+            continue
+          fi
+        ;;
+      esac
+      num_other_procs=$(($num_other_procs + 1))
+    done
+    if [ $num_other_procs -eq 0 ]; then
+      return 0
+    fi
+    sleep 1
+    seconds=$(($seconds + 1))
+  done
+
+  return 1
+}
+
+
 list_mounts() {
-  mount -t $fuse_fs_type | grep "^cvmfs2[[:space:]]"
+  # Matches lines that begin with cvmfs2 or /usr/bin/cvmfs2 (/bin/cvmfs2,
+  # /usr/local/bin/cvmfs2)
+  mount -t $fuse_fs_type | grep "^\(/[^[:space:]]*/\)\?cvmfs2[[:space:]]"
+}
+
+
+# cvmfs_readconfig must have been called before
+list_repos() {
+  if [ "x$CVMFS_REPOSITORIES" != "x" ]; then
+    echo "$(echo $CVMFS_REPOSITORIES | sed 's/,/ /g')"
+  fi
+}
+
+
+# Some of the cache directories might not exist yet.  It's necessary to list
+# them nevertheless to avoid a race in cvmfs_config reload.
+list_cache_directories() {
+  local repos="$(list_repos)"
+  local org
+  for org in $repos shared
+  do
+    . /etc/cvmfs/config.sh # start with fresh repository_... functions
+    cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
+    if [ "$org" != "shared" ]; then
+      fqrn=`cvmfs_mkfqrn $org`
+      cvmfs_readconfig $fqrn || die "Failed to read CernVM-FS configuration"
+    else
+      fqrn=shared
+    fi
+    cache_directories="${CVMFS_CACHE_BASE}/${fqrn} $cache_directories"
+  done
+  echo "$cache_directories" | tr ' ' '\n' | sort -u | tr '\n' ' '
+
+  . /etc/cvmfs/config.sh # start with fresh repository_... functions
+  cvmfs_readconfig || die "Failed to read CernVM-FS configuration"
 }
 
 
@@ -1382,8 +1578,6 @@ check_dev_fuse() {
       charDevice=/dev/fuse ;;
 
     Darwin )
-      #load osxfuse kernel extension
-      /Library/Filesystems/osxfusefs.fs/Support/load_osxfusefs
       charDevice=/dev/osxfuse0 ;;
 
     * )
@@ -1397,12 +1591,12 @@ check_dev_fuse() {
     echo "Error: character device $charDevice does not exist"
     return_code=$(($return_code+1))
   else
-    if ! runas $CVMFS_USER "test -r $charDevice"; then
-      echo "Error: $charDevice is not readable by user $CVMFS_USER"
+    if ! runascvmfsuser "test -r $charDevice"; then
+      echo "Error: $charDevice is not readable by cvmfs user"
       return_code=$(($return_code+1))
     fi
-    if ! runas $CVMFS_USER "test -w $charDevice"; then
-      echo "Error: $charDevice is not writable by user $CVMFS_USER"
+    if ! runascvmfsuser "test -w $charDevice"; then
+      echo "Error: $charDevice is not writable by cvmfs user"
       return_code=$(($return_code+1))
     fi
   fi
@@ -1515,6 +1709,20 @@ configure_autofs() {
         num_errors=$(($num_errors+1))
         AUTOMASTER=/dev/null
       fi
+      # Fix 'systemctl restart autofs' on CentOS 7 (CVM-1200)
+      if [ -e /usr/bin/systemctl ]; then
+        if /usr/bin/systemctl show -p KillMode autofs.service | \
+           grep -q control-group;
+        then
+          mkdir -p /etc/systemd/system/autofs.service.d
+          cat > /etc/systemd/system/autofs.service.d/cvmfs-autosetup.conf << EOF
+[Service]
+KillMode=process
+EOF
+          /usr/bin/systemctl daemon-reload
+        fi
+      fi
+
       sed -i "/^\/mnt\/cvmfs \/etc\/auto.cvmfs/d" $AUTOMASTER # Still needed or needs to be adjusted?
       local cvmfs_map="$CVMFS_MOUNT_DIR /etc/auto.cvmfs"
       if ! grep -q "^$cvmfs_map" $AUTOMASTER; then
@@ -1547,27 +1755,14 @@ configure_sudoers() {
     sudo sed -i .cvmfs_backup -e "/# added by CernVM-FS/d" /etc/sudoers
     sudo cat >> /etc/sudoers << EOF
 %everyone ALL=(cvmfs:cvmfs) NOPASSWD: /usr/bin/sudo # added by CernVM-FS
-cvmfs ALL= NOPASSWD: /usr/bin/cvmfs2 # added by CernVM-FS
-cvmfs ALL= NOPASSWD: /usr/bin/cvmfs2_debug # added by CernVM-FS
-%everyone ALL=(cvmfs:cvmfs) NOPASSWD: /usr/bin/cvmfs_talk -i * mountpoint # added by CernVM-FS
+cvmfs ALL= NOPASSWD: ${INSTALL_BASE}/bin/cvmfs2 # added by CernVM-FS
+cvmfs ALL= NOPASSWD: ${INSTALL_BASE}/bin/cvmfs2_debug # added by CernVM-FS
+%everyone ALL=(cvmfs:cvmfs) NOPASSWD: ${INSTALL_BASE}/bin/cvmfs_talk -i * mountpoint # added by CernVM-FS
 %everyone ALL=(cvmfs:cvmfs) NOPASSWD: /bin/mkdir # added by CernVM-FS
 cvmfs ALL= NOPASSWD: /usr/sbin/sysctl -w kern.maxfilesperproc=* kern.maxfiles=* # added by CernVM-FS
 %everyone ALL= NOPASSWD: /bin/mkdir -p /var/run/cvmfs # added by CernVM-FS
 %everyone ALL= NOPASSWD: /usr/sbin/chown $CVMFS_USER /var/run/cvmfs # added by CernVM-FS
 EOF
-  fi
-}
-
-
-check_fuse_config() {
-  grep "^user_allow_other" /etc/fuse.conf >/dev/null 2>&1
-  return $?
-}
-
-
-configure_fuse() {
-  if ! $(grep "^user_allow_other" /etc/fuse.conf >/dev/null 2>&1); then
-    echo "user_allow_other # added by CernVM-FS" >> /etc/fuse.conf
   fi
 }
 
@@ -1592,6 +1787,25 @@ get_attr() {
    esac
 }
 
+# Ensures that binaries needed during reload are found. Reload creates itself
+# a clean environment before execution.
+get_minimal_path() {
+  case $sys_arch in
+    Linux)
+      # On Linux, all the binaries needed during reload are in the default
+      # search paths
+      echo ""
+    ;;
+    Darwin)
+      echo "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    ;;
+    *)
+      echo "Architecture $sys_arch is not supported"
+      exit 1
+    ;;
+  esac
+}
+
 
 check_is_on() {
   local parameter=$1
@@ -1606,19 +1820,149 @@ check_is_on() {
 }
 
 
-runas() {
-  local user=$1
-  local cmd=$2
+runascvmfsuser() {
+  local cmd=$1
+
+  if [ -z "$CVMFS_USER" ]; then
+    return 1
+  fi
 
   case $sys_arch in
     Linux )
-      su -s /bin/sh $user -c "$cmd" ;;
+      su -s /bin/sh $CVMFS_USER -c "$cmd" ;;
 
     Darwin )
-      sudo -u $user $cmd ;;
+      sudo -u $CVMFS_USER $cmd ;;
   esac
 }
 
+
+base64_nowrap() {
+  case $(uname) in
+    Linux )
+      base64 -w0
+      ;;
+    Darwin )
+      base64 -b0
+      ;;
+  esac
+}
+
+
+__usrlocal_migrate_clean_legacy_binaries() {
+  echo "cleaning up legacy binaries..."
+  for binary in /usr/bin/cvmfs2               \
+                /usr/bin/cvmfs_config         \
+                /usr/bin/cvmfs_talk           \
+                /usr/bin/cvmfs_fsck           \
+                /sbin/mount_cvmfs             \
+                /usr/lib/libcvmfs_fuse*.dylib \
+                /etc/auto_cvmfs; do
+    if [ -f $binary   ] && \
+       [ ! -L $binary ]; then
+      rm -f "$binary"
+      echo "found and removed legacy binary '$binary'"
+    fi
+  done
+}
+
+__usrlocal_migrate_clean_legacy_directories() {
+  echo "cleaning up legacy directories..."
+  for directory in /etc/bash_completion.d/cvmfs \
+                   /usr/share/doc/cvmfs-*; do
+    if [ -d $directory ]; then
+      rm -fR "$directory"
+      echo "found and removed legacy directory '$directory'"
+    fi
+  done
+}
+
+__usrlocal_migrate_clean_and_rescue_legacy_configuration() {
+  local old_conf_dir="/etc/cvmfs"
+  local new_conf_dir="/usr/local/etc/cvmfs"
+
+  echo "cleaning up legacy configuration..."
+  if [ -L $old_conf_dir ] &&
+     [ x"$(readlink $old_conf_dir)" = x"$new_conf_dir" ]; then
+    echo "configuration already points to $new_conf_dir. do nothing."
+    return 0
+  fi
+
+  if [ ! -e $old_conf_dir ]; then
+    echo "no legacy configuration found. do nothing."
+    return 0
+  fi
+
+  # detect and remove all configuration files of previous CernVM-FS installs
+  # Note: This deletes only the configuration files that have been shipped with
+  #       CernVM-FS. Everything user-added stays intact.
+  for conf_file in config.d/atlas-nightlies.cern.ch.conf            \
+                   config.d/cms.cern.ch.conf                        \
+                   config.d/grid.cern.ch.conf                       \
+                   config.sh                                        \
+                   default.conf                                     \
+                   default.d/50-cern.conf                           \
+                   default.d/60-egi.conf                            \
+                   default.d/README                                 \
+                   domain.d/cern.ch.conf                            \
+                   domain.d/egi.eu.conf                             \
+                   domain.d/opensciencegrid.org.conf                \
+                   keys/cern.ch/cern-it1.cern.ch.pub                \
+                   keys/cern.ch/cern-it2.cern.ch.pub                \
+                   keys/cern.ch/cern-it3.cern.ch.pub                \
+                   keys/cern.ch/cern.ch.pub                         \
+                   keys/egi.eu/egi.eu.pub                           \
+                   keys/opensciencegrid.org/opensciencegrid.org.pub \
+                   serverorder.sh; do
+    local old_conf_file="${old_conf_dir}/${conf_file}"
+    if [ -f $old_conf_file ]; then
+      local quarantined_conf_file="${new_conf_dir}/quarantine/${conf_file}"
+      mkdir -p "$(dirname $quarantined_conf_file)"
+      mv -f "$old_conf_file" "$quarantined_conf_file"
+      echo "found and quarantined legacy configuration file '$conf_file'"
+    fi
+  done
+
+  # rescue all configuration files that have been added by the user
+  local cwd="$(pwd)"
+  cd "$old_conf_dir" # remove $old_conf_dir prefix from `find` output
+  for conf_file in $(find . -type f); do
+    echo "found and rescued user added configuration file '$conf_file'"
+    local rescued_conf_file="${new_conf_dir}/${conf_file}"
+    mkdir -p "$(dirname $rescued_conf_file)"
+    mv -f "$conf_file" "$rescued_conf_file"
+  done
+  cd "$cwd"
+
+  # remove legacy configuration directory
+  rm -fR /etc/cvmfs
+  echo "removed legacy configuration directory"
+}
+
+__usrlocal_migrate_clean_legacy_sudoers() {
+  echo "cleaning up legacy sudoers configuration..."
+  if cat /etc/sudoers | grep -q '# added by CernVM-FS'; then
+    local doomed_sudoers="$(cat /etc/sudoers | grep '# added by CernVM-FS')"
+    sed -i .cvmfs_backup -e "/# added by CernVM-FS/d" /etc/sudoers
+    echo "found and removed the following legacy sudoers configurations:"
+    echo "-----"
+    echo "$doomed_sudoers"
+    echo "-----"
+  fi
+}
+
+_usrlocal_migrate() {
+  # this cleans out left-overs from CernVM-FS versions prior to 2.2.0 as they
+  # used to be installed into /usr/... in contrast to newer versions that are
+  # compliant with Apple's "System Integrity Protection" that has been intro-
+  # duced with OS X El Capitan.
+  [ x"$sys_arch" = x"Darwin" ] || return 1
+
+  __usrlocal_migrate_clean_legacy_binaries
+  __usrlocal_migrate_clean_legacy_directories
+  __usrlocal_migrate_clean_and_rescue_legacy_configuration
+  __usrlocal_migrate_clean_legacy_sudoers
+}
 
 case "$1" in
   setup)
@@ -1671,7 +2015,13 @@ case "$1" in
 
   probe)
     shift 1
-    cvmfs_probe
+    cvmfs_probe $@
+    RETVAL=$?
+    ;;
+
+  fsck)
+    shift 1
+    cvmfs_config_fsck $@
     RETVAL=$?
     ;;
 
@@ -1692,6 +2042,15 @@ case "$1" in
     fi
     shift 1
     cvmfs_reload -c
+    RETVAL=$?
+    ;;
+
+  killall)
+    if [ `id -u` -ne 0 ]; then
+      echo "root privileges required"
+      exit 1
+    fi
+    cvmfs_killall $@
     RETVAL=$?
     ;;
 

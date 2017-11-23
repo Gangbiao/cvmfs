@@ -16,15 +16,14 @@
 #include <vector>
 
 #include "bigvector.h"
+#include "compression.h"
 #include "hash.h"
 #include "platform.h"
 #include "shortstring.h"
-#include "util.h"
 
 namespace publish {
 class SyncItem;
 }
-
 namespace swissknife {
 class CommandMigrate;
 }
@@ -50,6 +49,8 @@ enum SpecialDirents {
 /**
  * Wrapper around struct dirent.  Only contains file system related meta data
  * for a directory entry.
+ * TODO(jblomer): separation to DirectoryEntry not quite clear: this one also
+ * contains hash, compression algorithm and external flag
  */
 class DirectoryEntryBase {
   // For testing the catalog balancing
@@ -60,12 +61,15 @@ class DirectoryEntryBase {
   friend class publish::SyncItem;
   // Simplify file system like _touch_ of DirectoryEntry objects
   friend class SqlDirentTouch;
+  // Allow creation of virtual directories and files
+  friend class VirtualCatalog;
 
  public:
   static const inode_t kInvalidInode = 0;
 
   /**
-   * Used in the swissknife in for sanity checks and catalog migration.
+   * Used in the swissknife for sanity checks and catalog migration.  If
+   * anything is added, also adjust PrintDifferences in swissknife::CommandDiff.
    */
   struct Difference {
     static const unsigned int kIdentical                    = 0x000;
@@ -80,6 +84,9 @@ class DirectoryEntryBase {
     static const unsigned int kNestedCatalogTransitionFlags = 0x100;
     static const unsigned int kChunkedFileFlag              = 0x200;
     static const unsigned int kHasXattrsFlag                = 0x400;
+    static const unsigned int kExternalFileFlag             = 0x800;
+    static const unsigned int kBindMountpointFlag           = 0x1000;
+    static const unsigned int kHiddenFlag                   = 0x2000;
   };
   typedef unsigned int Differences;
 
@@ -88,7 +95,6 @@ class DirectoryEntryBase {
    */
   inline DirectoryEntryBase()
     : inode_(kInvalidInode)
-    , parent_inode_(kInvalidInode)
     , mode_(0)
     , uid_(0)
     , gid_(0)
@@ -96,15 +102,17 @@ class DirectoryEntryBase {
     , mtime_(0)
     , linkcount_(1)  // generally a normal file has linkcount 1 -> default
     , has_xattrs_(false)
+    , is_external_file_(false)
+    , compression_algorithm_(zlib::kZlibDefault)
     { }
 
   inline bool IsRegular() const                 { return S_ISREG(mode_); }
   inline bool IsLink() const                    { return S_ISLNK(mode_); }
   inline bool IsDirectory() const               { return S_ISDIR(mode_); }
+  inline bool IsExternalFile() const            { return is_external_file_; }
   inline bool HasXattrs() const                 { return has_xattrs_;    }
 
   inline inode_t inode() const                  { return inode_; }
-  inline inode_t parent_inode() const           { return parent_inode_; }
   inline uint32_t linkcount() const             { return linkcount_; }
   inline NameString name() const                { return name_; }
   inline LinkString symlink() const             { return symlink_; }
@@ -127,9 +135,6 @@ class DirectoryEntryBase {
   }
 
   inline void set_inode(const inode_t inode) { inode_ = inode; }
-  inline void set_parent_inode(const inode_t parent_inode) {
-    parent_inode_ = parent_inode;
-  }
   inline void set_linkcount(const uint32_t linkcount) {
     assert(linkcount > 0);
     linkcount_ = linkcount;
@@ -139,6 +144,10 @@ class DirectoryEntryBase {
   }
   inline void set_has_xattrs(const bool has_xattrs) {
     has_xattrs_ = has_xattrs;
+  }
+
+  inline zlib::Algorithms compression_algorithm() const {
+    return compression_algorithm_;
   }
 
   /**
@@ -175,8 +184,6 @@ class DirectoryEntryBase {
  protected:
   // Inodes are generated based on the rowid of the entry in the file catalog.
   inode_t inode_;
-  // Parent inode is dynamically created and not stored in the file catalog.
-  inode_t parent_inode_;
 
   // Data from struct stat
   NameString name_;
@@ -196,6 +203,11 @@ class DirectoryEntryBase {
   // it can be computed just using the file contents.  We therefore put it in
   // this base class.
   shash::Any checksum_;
+
+  bool is_external_file_;
+
+  // The compression algorithm
+  zlib::Algorithms compression_algorithm_;
 };
 
 
@@ -231,27 +243,30 @@ class DirectoryEntry : public DirectoryEntryBase {
    */
   inline explicit DirectoryEntry(const DirectoryEntryBase& base)
     : DirectoryEntryBase(base)
-    , cached_mtime_(0)
     , hardlink_group_(0)
     , is_nested_catalog_root_(false)
     , is_nested_catalog_mountpoint_(false)
+    , is_bind_mountpoint_(false)
     , is_chunked_file_(false)
+    , is_hidden_(false)
     , is_negative_(false) { }
 
   inline DirectoryEntry()
-    : cached_mtime_(0)
-    , hardlink_group_(0)
+    : hardlink_group_(0)
     , is_nested_catalog_root_(false)
     , is_nested_catalog_mountpoint_(false)
+    , is_bind_mountpoint_(false)
     , is_chunked_file_(false)
+    , is_hidden_(false)
     , is_negative_(false) { }
 
   inline explicit DirectoryEntry(SpecialDirents special_type)
-    : cached_mtime_(0)
-    , hardlink_group_(0)
+    : hardlink_group_(0)
     , is_nested_catalog_root_(false)
     , is_nested_catalog_mountpoint_(false)
+    , is_bind_mountpoint_(false)
     , is_chunked_file_(false)
+    , is_hidden_(false)
     , is_negative_(true) { assert(special_type == kDirentNegative); }
 
   inline SpecialDirents GetSpecial() const {
@@ -271,11 +286,11 @@ class DirectoryEntry : public DirectoryEntryBase {
   inline bool IsNestedCatalogMountpoint() const {
     return is_nested_catalog_mountpoint_;
   }
+  inline bool IsBindMountpoint() const { return is_bind_mountpoint_; }
   inline bool IsChunkedFile() const { return is_chunked_file_; }
+  inline bool IsHidden() const { return is_hidden_; }
   inline uint32_t hardlink_group() const { return hardlink_group_; }
-  inline time_t cached_mtime() const     { return cached_mtime_; }
 
-  inline void set_cached_mtime(const time_t value) { cached_mtime_ = value; }
   inline void set_hardlink_group(const uint32_t group) {
     hardlink_group_ = group;
   }
@@ -285,25 +300,29 @@ class DirectoryEntry : public DirectoryEntryBase {
   inline void set_is_nested_catalog_root(const bool val) {
     is_nested_catalog_root_ = val;
   }
+  inline void set_is_bind_mountpoint(const bool val) {
+    is_bind_mountpoint_ = val;
+  }
   inline void set_is_chunked_file(const bool val) {
     is_chunked_file_ = val;
   }
+  inline void set_is_hidden(const bool val) {
+    is_hidden_ = val;
+  }
 
  private:
-   /**
-    * Can be compared to mtime to figure out if caches need to be invalidated
-    * (file has changed).
-    */
-  time_t cached_mtime_;
   /**
    * Hardlink handling is emulated in CVMFS. Since inodes are allocated on
    * demand we save hardlink relationships using the same hardlink_group.
    */
   uint32_t hardlink_group_;
 
+  // TODO(jblomer): transform into bitfield to save memory
   bool is_nested_catalog_root_;
   bool is_nested_catalog_mountpoint_;
+  bool is_bind_mountpoint_;
   bool is_chunked_file_;
+  bool is_hidden_;
   bool is_negative_;
 };
 

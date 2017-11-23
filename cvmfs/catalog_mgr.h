@@ -24,7 +24,6 @@
 #include "hash.h"
 #include "logging.h"
 #include "statistics.h"
-#include "util.h"
 
 class XattrList;
 
@@ -37,7 +36,7 @@ const unsigned kSqliteMemPerThread = 1*1024*1024;
  */
 enum LookupOptions {
   kLookupSole        = 0x01,
-  kLookupFull        = 0x02,
+  // kLookupFull        = 0x02  not used anymore
   kLookupRawSymlink  = 0x10,
 };
 
@@ -150,9 +149,6 @@ class AbstractCatalogManager : public SingleCopy {
   LoadError Remount(const bool dry_run);
   void DetachNested();
 
-  //  Not needed anymore since there are the glue buffers
-  //  bool LookupInode(const inode_t inode, const LookupOptions options,
-  //                   DirectoryEntry *entry);
   bool LookupPath(const PathString &path, const LookupOptions options,
                   DirectoryEntry *entry);
   bool LookupPath(const std::string &path, const LookupOptions options,
@@ -177,15 +173,20 @@ class AbstractCatalogManager : public SingleCopy {
                       FileChunkList *chunks);
   void SetOwnerMaps(const OwnerMap &uid_map, const OwnerMap &gid_map);
 
+  shash::Any GetNestedCatalogHash(const PathString &mountpoint);
+
   Statistics statistics() const { return statistics_; }
   uint64_t inode_gauge() {
     ReadLock(); uint64_t r = inode_gauge_; Unlock(); return r;
   }
+  bool volatile_flag() const { return volatile_flag_; }
   uint64_t GetRevision() const;
-  bool GetVolatileFlag() const;
   uint64_t GetTTL() const;
+  bool HasExplicitTTL() const;
+  bool GetVOMSAuthz(std::string *authz) const;
   int GetNumCatalogs() const;
   std::string PrintHierarchy() const;
+  std::string PrintAllMemStatistics() const;
 
   /**
    * Get the inode number of the root DirectoryEntry
@@ -196,6 +197,7 @@ class AbstractCatalogManager : public SingleCopy {
     return inode_annotation_ ?
       inode_annotation_->Annotate(kInodeOffset + 1) : kInodeOffset + 1;
   }
+  inline CatalogT* GetRootCatalog() const { return catalogs_.front(); }
   /**
    * Inodes are ambiquitous under some circumstances, to prevent problems
    * they must be passed through this method first
@@ -245,7 +247,6 @@ class AbstractCatalogManager : public SingleCopy {
   bool IsAttached(const PathString &root_path,
                   CatalogT **attached_catalog) const;
 
-  inline CatalogT* GetRootCatalog() const { return catalogs_.front(); }
   CatalogT *FindCatalog(const PathString &path) const;
 
   inline void ReadLock() const {
@@ -275,6 +276,19 @@ class AbstractCatalogManager : public SingleCopy {
   uint64_t inode_gauge_;  /**< highest issued inode */
   uint64_t revision_cache_;
   /**
+   * Not protected by a read lock because it can only change when the root
+   * catalog is exchanged (during big global lock of the file system).
+   */
+  bool volatile_flag_;
+  /**
+   * Saves the result of GetVOMSAuthz when a root catalog is attached
+   */
+  bool has_authz_cache_;
+  /**
+   * Saves the VOMS requirements when a root catalog is attached
+   */
+  std::string authz_cache_;
+  /**
    * Counts how often the inodes have been invalidated.
    */
   uint64_t incarnation_;
@@ -290,6 +304,7 @@ class AbstractCatalogManager : public SingleCopy {
   // Catalog *Inode2Catalog(const inode_t inode);
   std::string PrintHierarchyRecursively(const CatalogT *catalog,
                                         const int level) const;
+  std::string PrintMemStatsRecursively(const CatalogT *catalog) const;
 
   InodeRange AcquireInodes(uint64_t size);
   void ReleaseInodes(const InodeRange chunk);

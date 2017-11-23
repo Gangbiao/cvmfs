@@ -20,10 +20,12 @@
 #include <string>
 #include <vector>
 
+#include "logging.h"
 #include "options.h"
 #include "platform.h"
 #include "sanitizer.h"
-#include "util.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -137,9 +139,9 @@ static bool CheckProxy() {
 }
 
 
-static bool CheckConcurrentMount(const string &fqrn, const string &cachedir) {
+static bool CheckConcurrentMount(const string &fqrn, const string &workspace) {
   // Try connecting to cvmfs_io socket
-  int socket_fd = ConnectSocket(cachedir + "/cvmfs_io." + fqrn);
+  int socket_fd = ConnectSocket(workspace + "/cvmfs_io." + fqrn);
   if (socket_fd < 0)
     return true;
 
@@ -151,22 +153,22 @@ static bool CheckConcurrentMount(const string &fqrn, const string &cachedir) {
     mountpoint.push_back(buf);
   }
   close(socket_fd);
-  int output_flags = kLogStderr;
-  if (!mountpoint.empty() && (mountpoint[mountpoint.length()-1] == '\n'))
-    output_flags |= kLogNoLinebreak;
-  LogCvmfs(kLogCvmfs, output_flags, "Repository %s is already mounted on %s",
-           fqrn.c_str(), mountpoint.c_str());
   return false;
 }
 
 
 static bool GetCacheDir(const string &fqrn, string *cachedir) {
   string param;
-  int retval = options_manager_.GetValue("CVMFS_CACHE_BASE", &param);
-  if (!retval) {
-    LogCvmfs(kLogCvmfs, kLogStderr, "CVMFS_CACHE_BASE required");
-    return false;
+  bool retval = options_manager_.GetValue("CVMFS_CACHE_DIR", &param);
+  if (retval) {
+    *cachedir = MakeCanonicalPath(param);
+    return true;
   }
+
+  retval = options_manager_.GetValue("CVMFS_CACHE_BASE", &param);
+  if (!retval)
+    return false;
+
   *cachedir = MakeCanonicalPath(param);
   if (options_manager_.GetValue("CVMFS_SHARED_CACHE", &param) &&
       options_manager_.IsOn(param))
@@ -174,6 +176,24 @@ static bool GetCacheDir(const string &fqrn, string *cachedir) {
     *cachedir = *cachedir + "/shared";
   } else {
     *cachedir = *cachedir + "/" + fqrn;
+  }
+  return true;
+}
+
+
+static bool GetWorkspace(const string &fqrn, string *workspace) {
+  string param;
+  bool retval = options_manager_.GetValue("CVMFS_WORKSPACE", &param);
+  if (retval) {
+    *workspace = MakeCanonicalPath(param);
+    return true;
+  }
+
+  retval = GetCacheDir(fqrn, workspace);
+  if (!retval) {
+    LogCvmfs(kLogCvmfs, kLogStderr,
+             "CVMFS_WORKSPACE or CVMFS_CACHE_[BASE|DIR] required");
+    return false;
   }
   return true;
 }
@@ -226,11 +246,9 @@ static std::string GetCvmfsBinary() {
   paths.push_back("/usr/bin");
 
 #ifdef __APPLE__
-  int major, minor, patch;
-  platform_get_os_version(&major, &minor, &patch);
-  if (major == 10 && minor >= 11) {    // OS X El Capitan came with SIP, forcing
-    paths.push_back("/usr/local/bin"); // us to become relocatable
-  }
+  // OS X El Capitan came with SIP, forcing us to become relocatable. CVMFS
+  // 2.2.0+ installs into /usr/local always
+  paths.push_back("/usr/local/bin");
 #endif
 
   // TODO(reneme): C++11 range based for loop
@@ -250,9 +268,11 @@ static std::string GetCvmfsBinary() {
 
 int main(int argc, char **argv) {
   bool dry_run = false;
+  bool remount = false;
   vector<string> mount_options;
 
   // Option parsing
+  vector<string> option_tokens;
   int c;
   while ((c = getopt(argc, argv, "vfnho:")) != -1) {
     switch (c) {
@@ -270,6 +290,11 @@ int main(int argc, char **argv) {
         return 0;
       case 'o':
         AddMountOption(optarg, &mount_options);
+        option_tokens = SplitString(optarg, ',');
+        for (unsigned i = 0; i < option_tokens.size(); ++i) {
+          if (option_tokens[i] == string("remount"))
+            remount = true;
+        }
         break;
       default:
         Usage(kLogStderr);
@@ -282,11 +307,12 @@ int main(int argc, char **argv) {
   }
 
   string device = argv[optind];
-  // For Ubuntu 8.04 automounter
-  if (HasPrefix(device, "/cvmfs/", false))
-    device = device.substr(7);
+  // Some mount versions expand the given device to a full path.  Thus ignore
+  // everything before the last slash (/)/
+  if (HasPrefix(device, "/", false))
+    device = GetFileName(device);
   sanitizer::RepositorySanitizer repository_sanitizer;
-  if (!repository_sanitizer.IsValid(device)) {
+  if (device.empty() || !repository_sanitizer.IsValid(device)) {
     LogCvmfs(kLogCvmfs, kLogStderr, "Invalid repository: %s", device.c_str());
     return 1;
   }
@@ -298,13 +324,17 @@ int main(int argc, char **argv) {
 
   int retval;
   int sysret;
+  bool dedicated_cachedir = false;
   string cvmfs_user;
   string cachedir;
+  string workspace;
   // Environment checks
   retval = WaitForReload(mountpoint);
   if (!retval) return 1;
-  retval = GetCacheDir(fqrn, &cachedir);
+  retval = GetWorkspace(fqrn, &workspace);
   if (!retval) return 1;
+  retval = GetCacheDir(fqrn, &cachedir);
+  dedicated_cachedir = (retval && (cachedir != workspace));
   retval = GetCvmfsUser(&cvmfs_user);
   if (!retval) return 1;
   retval = CheckFuse();
@@ -318,8 +348,25 @@ int main(int argc, char **argv) {
   // If the same repository is mounted multiple times at the same time, there
   // is a race here.  Eventually, only one repository will be mounted while the
   // other cvmfs processes block on a file lock in the cache.
-  retval = CheckConcurrentMount(fqrn, cachedir);
-  if (!retval) return 1;
+  int output_flags = kLogStderr;
+  if (!mountpoint.empty() && (mountpoint[mountpoint.length()-1] == '\n'))
+    output_flags |= kLogNoLinebreak;
+  retval = CheckConcurrentMount(fqrn, workspace);
+  if (!retval) {
+    if (remount)
+      return 0;
+
+    LogCvmfs(kLogCvmfs, output_flags, "Repository %s is already mounted on %s",
+             fqrn.c_str(), mountpoint.c_str());
+    return 1;
+  } else {
+    // No double mount
+    if (remount) {
+      LogCvmfs(kLogCvmfs, output_flags, "Repository %s is not mounted on %s",
+               fqrn.c_str(), mountpoint.c_str());
+      return 1;
+    }
+  }
 
   // Retrieve cvmfs uid/gid and fuse gid if exists
   uid_t uid_cvmfs;
@@ -334,23 +381,40 @@ int main(int argc, char **argv) {
   }
   has_fuse_group = GetGidOf("fuse", &gid_fuse);
 
-  // Prepare cache directory
-  retval = MkdirDeep(cachedir, 0755);
+  // Prepare workspace and cache directory
+  retval = MkdirDeep(workspace, 0755, false);
   if (!retval) {
-    LogCvmfs(kLogCvmfs, kLogStderr, "Failed to create cache directory %s",
-             cachedir.c_str());
+    LogCvmfs(kLogCvmfs, kLogStderr, "Failed to create workspace %s",
+             workspace.c_str());
     return 1;
+  }
+  if (dedicated_cachedir) {
+    retval = MkdirDeep(cachedir, 0755, false);
+    if (!retval) {
+      LogCvmfs(kLogCvmfs, kLogStderr, "Failed to create cache directory %s",
+               cachedir.c_str());
+      return 1;
+    }
   }
   retval = MkdirDeep("/var/run/cvmfs", 0755);
   if (!retval) {
     LogCvmfs(kLogCvmfs, kLogStderr, "Failed to create socket directory");
     return 1;
   }
-  sysret = chown(cachedir.c_str(), uid_cvmfs, getegid());
+  sysret = chown(workspace.c_str(), uid_cvmfs, getegid());
   if (sysret != 0) {
     LogCvmfs(kLogCvmfs, kLogStderr, "Failed to transfer ownership of %s to %s",
-             cachedir.c_str(), cvmfs_user.c_str());
+             workspace.c_str(), cvmfs_user.c_str());
     return 1;
+  }
+  if (dedicated_cachedir) {
+    sysret = chown(cachedir.c_str(), uid_cvmfs, getegid());
+    if (sysret != 0) {
+      LogCvmfs(kLogCvmfs, kLogStderr,
+               "Failed to transfer ownership of %s to %s",
+               cachedir.c_str(), cvmfs_user.c_str());
+      return 1;
+    }
   }
   sysret = chown("/var/run/cvmfs", uid_cvmfs, getegid());
   if (sysret != 0) {

@@ -33,6 +33,7 @@ CVMFS_TEST_SERVER_CACHE=${CVMFS_TEST_SERVER_CACHE:=}
 
 # These OPT variables are for the benchmark options under the benchmarks folder
 CVMFS_OPT_WARM_CACHE=${CVMFS_OPT_WARM_CACHE:=yes}
+CVMFS_OPT_HOT_CACHE=${CVMFS_OPT_HOT_CACHE:=no}
 CVMFS_OPT_TALK_STATISTICS=${CVMFS_OPT_TALK_STATISTICS:=yes}
 CVMFS_OPT_VALGRIND=${CVMFS_OPT_VALGRIND:=yes}
 CVMFS_OPT_ITERATIONS=${CVMFS_OPT_ITERATIONS:=1}
@@ -65,6 +66,56 @@ die() {
 }
 
 
+running_on_osx() {
+  [ "x$(uname)" == "xDarwin" ]
+}
+
+get_xattr() {
+  local extended_attr="$1"
+  local repo="$2"
+  if running_on_osx; then
+    xattr -p user.$extended_attr "$repo"
+  else
+    attr -qg $extended_attr "$repo"
+  fi
+}
+
+list_xattrs() {
+  local repo="$1"
+  if running_on_osx; then
+    xattr "$repo"
+  else
+    attr -ql "$repo"
+  fi
+}
+
+show_mounted() {
+  if running_on_osx; then
+    mount
+  else
+    cat /proc/mounts
+  fi
+}
+
+get_user_data() {
+  local user=$1
+  if running_on_osx; then
+    id -P "$user"
+  else
+    getent passwd "$user"
+  fi
+}
+
+stat_wrapper() {
+  local format=$1
+  local repo=$2
+  if running_on_osx; then
+    stat -f $format $repo
+  else
+    stat -c $format $repo
+  fi
+}
+
 # Find the service binary (or detect systemd)
 minpidof() {
   pidof $1 | tr " " "\n" | sort --numeric-sort | head -n1
@@ -77,6 +128,8 @@ if ! pidof systemd > /dev/null 2>&1 || [ $(minpidof systemd) -ne 1 ]; then
     SERVICE_BIN="/usr/sbin/service" # Ubuntu
   elif [ -x /sbin/rc-service ]; then
     SERVICE_BIN="/sbin/rc-service" # OpenRC
+  elif running_on_osx; then
+    SERVICE_BIN="false" # we don't need to run any service on mac
   else
     die "Neither systemd nor service binary detected"
   fi
@@ -84,6 +137,25 @@ fi
 
 is_systemd() {
   [ x"$SERVICE_BIN" = x"false" ]
+}
+
+is_redhat() {
+  [ -e /etc/redhat-release ]
+}
+
+is_el7() {
+  is_redhat && which lsb_release > /dev/null 2>&1 && \
+  [ x"$(lsb_release -rs | cut -f1 -d'.')" = x"7" ]
+}
+
+is_el6() {
+  is_redhat && which lsb_release > /dev/null 2>&1 && \
+  [ x"$(lsb_release -rs | cut -f1 -d'.')" = x"6" ]
+}
+
+is_el5() {
+  is_redhat && which lsb_release > /dev/null 2>&1 && \
+  [ x"$(lsb_release -rs | cut -f1 -d'.')" = x"5" ]
 }
 
 # find the name of the httpd service
@@ -112,6 +184,10 @@ normalize_version() {
   echo "$version_string"
 }
 
+to_syslog() {
+  logger -t cvmfs_test "$1"
+}
+
 version_major() { echo $1 | cut --delimiter=. --fields=1; }
 version_minor() { echo $1 | cut --delimiter=. --fields=2; }
 version_patch() { echo $1 | cut --delimiter=. --fields=3; }
@@ -135,8 +211,23 @@ service_request() {
   local service_name=$1
   local request_verb=$2
   if is_systemd; then
-    sudo systemctl $request_verb $service_name
+    echo "using systemd"
+    if [ "x$request_verb" = "xrestart" ]; then
+      # Prevent "service restarted too often" failures
+      sudo systemctl reset-failed $service_name
+      sudo systemctl stop $service_name
+      if ! sudo systemctl start $service_name; then
+        sleep 10
+        sudo systemctl start $service_name
+      fi
+    else
+      if ! sudo systemctl $request_verb $service_name; then
+        sleep 10
+        sudo systemctl $request_verb $service_name
+      fi
+    fi
   else
+    echo "using traditional service binary"
     sudo $SERVICE_BIN $service_name $request_verb
   fi
 }
@@ -148,6 +239,8 @@ service_request() {
 service_switch() {
   local service_name=$1
   local state=$2
+
+  running_on_osx && return 0
 
   case $state in
     on)
@@ -195,7 +288,11 @@ service_should_switch() {
 # checks if autofs is running on /cvmfs
 # @return   0 when autofs is mounted on /cvmfs
 autofs_check() {
-  cat /proc/mounts | grep -q "^/etc/auto.cvmfs /cvmfs "
+  if running_on_osx; then
+    return 0
+  else
+    cat /proc/mounts | grep -q "^/etc/auto.cvmfs /cvmfs "
+  fi
 }
 
 
@@ -263,16 +360,16 @@ break_hardlink() {
 
 
 cvmfs_clean() {
-  sudo cvmfs_config umount > /dev/null || return 100
-  sudo sh -c "rm -rf /var/lib/cvmfs/*"
-  sudo rm -f /etc/cvmfs/default.local
-  sudo sh -c "rm -f /etc/cvmfs/config.d/*"
-  sudo sh -c "cat /dev/null > $CVMFS_TEST_SYSLOG_TARGET"
+  sudo cvmfs_config umount > /dev/null                   || return 100
+  sudo sh -c "rm -rf /var/lib/cvmfs/*"                   || return 101
+  sudo rm -f /etc/cvmfs/default.local                    || return 102
+  sudo sh -c "rm -f /etc/cvmfs/config.d/*"               || return 103
+  sudo sh -c "cat /dev/null > $CVMFS_TEST_SYSLOG_TARGET" || return 104
 
   local timeout=60
   while $(pgrep -u cvmfs cvmfs2 > /dev/null); do
     if [ $timeout -eq 0 ]; then
-      return 101
+      return 99
     fi
     timeout=$(($timeout-1))
     sleep 1
@@ -281,8 +378,31 @@ cvmfs_clean() {
   return 0
 }
 
+cvmfs_disable_config_repository() {
+  sudo sh -c "echo 'CVMFS_CONFIG_REPOSITORY=' > /etc/cvmfs/default.d/99_no_config_repo.conf" \
+    || return $?
+}
+
+cvmfs_enable_config_repository() {
+  sudo rm -f /etc/cvmfs/default.d/99_no_config_repo.conf || return $?
+}
+
+cvmfs_mount_direct() {
+  repositories=$1
+  eval $(cvmfs_config showconfig | grep -e ^CVMFS_CONFIG_REPOSITORY=)
+  if [ "x$CVMFS_CONFIG_REPOSITORY" != "x" ]; then
+    _cvmfs_mount_manually "$CVMFS_CONFIG_REPOSITORY"
+  fi
+  for i in $(echo "$repositories" | tr "," " "); do
+    _cvmfs_mount_manually "$i" || return 102
+  done
+}
 
 cvmfs_mount() {
+  if [ x$PARROT_ENABLED = "xTRUE" ]; then
+    return 0
+  fi
+
   repositories=$1
   shift 1
 
@@ -303,13 +423,30 @@ cvmfs_mount() {
   if [ "x$CVMFS_TEST_DEBUGLOG" != "x" ]; then
     sudo sh -c "echo \"CVMFS_DEBUGLOG=$CVMFS_TEST_DEBUGLOG\" >> /etc/cvmfs/default.local" || return 100
   fi
+
+  if running_on_osx; then
+    cvmfs_mount_direct $repositories
+  fi
+
   cvmfs_config probe > /dev/null 2>&1 || return 101
 
   return 0
 }
 
 
+_cvmfs_mount_manually() {
+  local repository=$1
+  cvmfs_config status | grep -q "/cvmfs/$repository" && return 0
+  mkdir -p "/cvmfs/$repository"
+  sudo mount -t cvmfs "$repository" "/cvmfs/$repository" >/dev/null 2>&1
+}
+
+
 cvmfs_umount() {
+  if [ x$PARROT_ENABLED = "xTRUE" ]; then
+    return 0
+  fi
+
   local repositories=$1
   local times=5
   local result=-1
@@ -331,13 +468,16 @@ cvmfs_umount() {
     fi
 
     local timeout=5
-    while cat /proc/mounts | grep -q " /cvmfs/$r "; do
+    while show_mounted | grep -q " /cvmfs/$r "; do
       if [ $timeout -eq 0 ]; then
         return 101
       fi
       timeout=$(($timeout-1))
       sleep 1
     done
+
+    times=5
+    result=-1
   done
 
   return 0
@@ -345,14 +485,19 @@ cvmfs_umount() {
 
 
 has_selinux() {
-  [ -f /selinux/enforce ] && [ $(cat /selinux/enforce) -ne 0 ]
+  which sestatus   > /dev/null 2>&1 && \
+  which getenforce > /dev/null 2>&1 && \
+  getenforce | grep -qi "enforc" || return 1
 }
 
 
 get_cvmfs_cachedir() {
   local repository=$1
 
-  local cache_dir=$(cvmfs_config showconfig $repository | grep CVMFS_CACHE_DIR | awk '{print $1}' | cut -d= -f2)
+  local cache_dir=$(cvmfs_config showconfig $repository | grep CVMFS_WORKSPACE | awk '{print $1}' | cut -d= -f2)
+  if [ "x$cache_dir" = "x" ]; then
+    cache_dir=$(cvmfs_config showconfig $repository | grep CVMFS_CACHE_DIR | awk '{print $1}' | cut -d= -f2)
+  fi
   if [ "x$cache_dir" = "x" ]; then
     echo "Failed to figure out cache directory"
     exit 1
@@ -428,10 +573,7 @@ check_memory() {
   local rss_kb=$(echo $rss | awk '{print $2}')
 
   if [ $rss_kb -gt $limit ]; then
-    local inode_tracker="$(sudo cvmfs_talk -i $instance internal affairs | grep 'inode tracker')"
-    local inserts=$(sudo cvmfs_talk -i $instance internal affairs | grep '^inode_tracker.n_insert' | cut -d\| -f2)
-    local removes=$(sudo cvmfs_talk -i $instance internal affairs | grep '^inode_tracker.n_remove' | cut -d\| -f2)
-    local elements=$(( $inserts - $removes ))
+    local elements=$(sudo cvmfs_talk -i $instance internal affairs | grep '^inode_tracker.no_reference' | cut -d\| -f2)
 
     echo "Memory limit of $limit kB was exceeded by $instance which used $rss_kb kB"
     echo "We've had $elements items in the inode tracker"
@@ -453,7 +595,10 @@ min() {
 
 destroy_repo() {
   local repo=$1
-  sudo cvmfs_server rmfs -f $repo || return 100
+  shift 1
+  local additional_flags="$@"
+
+  sudo cvmfs_server rmfs -f $additional_flags $repo || return 100
 }
 
 
@@ -480,7 +625,6 @@ create_repo() {
   local uid=$2
   local debug_log=$3
   shift $(min $# 3)
-  local extra_options="$*"
 
   echo "Shutting down autofs for the cvmfs mounts"
   autofs_switch off || return 100
@@ -490,7 +634,7 @@ create_repo() {
     destroy_repo $repo || return 101
   fi
 
-  echo "Creating new repository $repo..."
+  echo -n "Creating new repository $repo (with extra options "$@") ..."
   local s3_config=""
   local stratum0=""
   local unionfs=""
@@ -506,18 +650,19 @@ create_repo() {
     echo "  UnionFS: $CVMFS_TEST_UNIONFS"
     unionfs=" -f $CVMFS_TEST_UNIONFS"
   fi
-  sudo cvmfs_server mkfs -o $uid -m                \
-                         -a ${CVMFS_TEST_HASHALGO} \
-                         $s3_config                \
-                         $stratum0                 \
-                         $unionfs                  \
-                         $extra_options $repo || return 102
+  sudo -E cvmfs_server mkfs -o $uid -m                \
+                            -a ${CVMFS_TEST_HASHALGO} \
+                            $s3_config                \
+                            $stratum0                 \
+                            $unionfs                  \
+                            "$@" $repo || return 102
 
   local client_conf="/etc/cvmfs/repositories.d/${repo}/client.conf"
   apply_server_cache_config $repo || return 103
 
   if [ x$debug_log != x -a x$debug_log != xNO ]; then
     echo "CVMFS_DEBUGLOG=$debug_log" | sudo tee -a $client_conf
+    sudo sed -i.bak -e "s/^\(cvmfs2#$repo.*\)\(allow_other.*\)/\1debug,\2/" /etc/fstab
   fi
 }
 
@@ -527,9 +672,8 @@ create_empty_repo() {
   local uid=$2
   local debug_log=$3
   shift $(min $# 3)
-  local extra_options="$*"
 
-  create_repo $repo $uid $debug_log "$extra_options" || return 101
+  create_repo $repo $uid $debug_log "$@" || return 101
 
   sudo cvmfs_server transaction $repo || return 102
   rm -f /cvmfs/$repo/new_repository
@@ -602,9 +746,8 @@ import_repo() {
     echo "  UnionFS: $CVMFS_TEST_UNIONFS"
     unionfs=" -f $CVMFS_TEST_UNIONFS"
   fi
-  sudo cvmfs_server import -o $uid $unionfs $extra_options $repo || return 102
+  sudo -E cvmfs_server import -o $uid $unionfs $extra_options $repo || return 102
 
-  local client_conf="/etc/cvmfs/repositories.d/${repo}/client.conf"
   apply_server_cache_config $repo || return 103
 }
 
@@ -615,9 +758,14 @@ get_stratum1_name() {
 }
 
 
+# creates a repository replica, as is done on stratum 1s
+# @param replica_name  the name of the new replica
+# @param replica_owner the owner of the new replica
+# @param stratum0_url  the url for the source repository
+# @param stratum0_pub  the public key the repository
 create_stratum1() {
   local replica_name=$1
-  local uid=$2
+  local replica_owner=$2
   local stratum0_url=$3
   local stratum0_pub=$4
   shift 4
@@ -630,12 +778,12 @@ create_stratum1() {
     echo "  Stratum1:  $stratum1_url"
     s3_config=" -s $CVMFS_TEST_S3_CONFIG -w $stratum1_url -a"
   fi
-  sudo cvmfs_server add-replica -o $CVMFS_TEST_USER    \
-                                -n $replica_name       \
-                                $s3_config             \
-                                $additional_parameters \
-                                $stratum0_url          \
-                                $stratum0_pub
+  sudo -E cvmfs_server add-replica -o $replica_owner      \
+                                   -n $replica_name       \
+                                   $s3_config             \
+                                   $additional_parameters \
+                                   $stratum0_url          \
+                                   $stratum0_pub
 }
 
 # creates a big file at a given location with a given size
@@ -776,6 +924,8 @@ run_background_service() {
   rm -f $fifo
 
   # check if the background process is running
+  # TODO(rmeusel): Fix this race. If the background service is a short living
+  #                process it might have successfully terminated at this point.
   if ! sudo kill -0 $srv_pid > /dev/null 2>&1; then
     return 4
   fi
@@ -800,20 +950,54 @@ open_silent_port() {
   local protocol=$1
   local port=$2
   local logfile=$3
-  local pid
   local cmd
-  local retcode
+  local mock
 
-  cmd="sudo python ${TEST_ROOT}/common/mock_services/silent_socket.py $protocol $port"
-  pid=$(run_background_service $logfile "$cmd")
-  retcode=$?
+  mock="python ${TEST_ROOT}/common/mock_services/silent_socket.py $protocol $port"
 
-  if [ $retcode -ne 0 ]; then
-    return $retcode
-  fi
+  # Do similar fifo-trick as in run_background_service() to get the PID of the
+  # actual silent_socket.py process rather than just the `sudo` around it.
+  local fifo="pid_silent_port_fifo"
+  mkfifo $fifo || return 1
+  cmd="sudo sh -c \"echo \\\$\\\$ > $fifo; exec $mock\""
+  run_background_service $logfile "$cmd" > /dev/null 2>&1 || return $?
+  cat $fifo # return the PID of the `python silent_socket.py`
+}
 
-  echo $pid
-  return $retcode
+
+# spawns a mocked HTTP server on a given port and document root location
+# Note: The user is responsible to kill the server process once after usage
+#
+# @param document_root  absolute path to be served via HTTP
+# @param port           http port to be used
+# @param logfile        (optional) where to log the HTTP server's status info
+# @return               PID of HTTP server or >0 on error
+open_http_server() {
+  local document_root="$1"
+  local port="$2"
+  local logfile="${3:=/dev/null}"
+
+  local http_server="${TEST_ROOT}/common/mock_services/http_server.py"
+  local http_pid=
+  local http_sentinel="http://localhost:${port}/http_sentinel"
+
+  # spawning the server
+  http_pid=$(run_background_service $logfile "$http_server -p $port -r $document_root")
+  touch ${document_root}/$(basename $http_sentinel)
+
+  # waiting for the server to come up
+  local timeout=15
+  while ! curl -Is $url ${http_sentinel} | head -n1 | grep "200 OK" >> $logfile 2>&1 && \
+        [ $timeout -gt 0 ]; do
+    sleep 1
+    if ! kill -0 $http_pid > /dev/null 2>&1;then
+      return 1
+    fi
+    timeout=$(( $timeout - 1 ))
+  done
+
+  [ $timeout -gt 0 ] || return 2
+  echo "$http_pid"
 }
 
 
@@ -838,6 +1022,27 @@ get_catalog_count() {
   echo $(cvmfs_server list-catalogs -x $repo_name | wc -l)
 }
 
+# read one specific manifest field of the specified repository
+# @param field_tag  the manifest field to be retrieved (one character)
+# @param (stdin)    the manifest to be investigated
+# return            the content of the specified manifest field
+get_manifest_field_from_manifest() {
+  local field_tag="$1"
+  grep --text -e "^$field_tag" | head -n1 | sed "s/^$field_tag\(.*\)$/\1/"
+}
+
+# read one specific manifest field of the specified repository
+# @param repo_name  the repository to be investigated
+# @param field_tag  the manifest field to be retrieved (one character)
+# return            the content of the specified manifest field
+get_manifest_field() {
+  local repo_name=$1
+  local field_tag=$2
+  load_repo_config $repo_name
+  local manifest_url="$(get_repo_url $repo_name)/.cvmfspublished"
+  curl -s "$manifest_url" | get_manifest_field_from_manifest "$field_tag"
+}
+
 # retrieves the hash of the current root catalog of the given
 # repository by investigating the manifest
 # @param repo_name  the name of the repository
@@ -845,15 +1050,21 @@ get_catalog_count() {
 get_current_root_catalog() {
   local repo_name=$1
   local manifest_url="$(get_repo_url $repo_name)/.cvmfspublished"
-  local catalog_record=$(curl "$manifest_url" 2>/dev/null | grep --text '^C[a-f0-9]*\(-[a-z0-9]*\)\?$')
-                                                                        # ^^~~~~~~~^ ^~~~~~~~~~~~^
-                                                                        # ||       | |           |
-                                                                        # ||       | +-----------+-- (optional) Hash Suffix
-                                                                        # |+-------+---------------- Hash String
-                                                                        # +------------------------- Manifest Field Identifier
-  local characters=$(echo -n $catalog_record | wc -c)
-  echo -n $catalog_record | tail -c $(( $characters - 1 ))
+  get_manifest_field $repo_name "C"
 }
+
+# downloads and decompresses the root catalog of a given repository for deeper
+# inspection
+# @param repo_name   the repository to download the root catalog from
+# @param object_hash the object to be downloaded and decompressed
+# @return            prints the file name of the extracted catalog to stdout
+get_and_decompress_root_catalog() {
+  local repo_name=$1
+  local catalog_hash="$(get_current_root_catalog $repo_name)C"
+  download_and_decompress_object $repo_name $catalog_hash
+}
+
+
 
 # uses `cvmfs_server check` to check the integrity of the catalog structure
 # additionally it might check the backend storage integrity as well when
@@ -903,29 +1114,18 @@ publish_repo() {
   local repo=$1
   shift 1
 
-  # parse the command line arguments (keep quotation marks)
-  local args="-v"
-  while [ $# -gt 0 ]; do
-    if echo "$1" | grep -q "[[:space:]]"; then
-      args="$args \"$1\""
-    else
-      args="$args $1"
-    fi
-    shift 1
-  done
-
   # enable the debug mode?
   # in debug mode we redirect output directly to the interactive shell,
   # overriding any redirections to logfiles or whatever... We want to hack!
   case $CVMFS_TEST_SRVDEBUG in
     fail)
-      cvmfs_server publish -d $args $repo > /dev/tty 2>&1 || return 100
+      cvmfs_server publish -dv "$@" $repo > /dev/tty 2>&1 || return 100
     ;;
     startup)
-      cvmfs_server publish -D $args $repo > /dev/tty 2>&1 || return 100
+      cvmfs_server publish -Dv "$@" $repo > /dev/tty 2>&1 || return 100
     ;;
     *)
-      cvmfs_server publish $args $repo || return 100
+      cvmfs_server publish -v "$@" $repo || return 100
     ;;
   esac
 
@@ -944,7 +1144,11 @@ load_repo_config() {
 
 
 get_millisecond_epoch() {
-  echo $(( $(date +%s%N) / 1000000 ))
+  if running_on_osx; then
+    echo $(( $(date +%s) * 1000 ))
+  else
+    echo $(( $(date +%s%N) / 1000000 ))
+  fi
 }
 
 
@@ -1054,15 +1258,11 @@ get_apache_version() {
 # figure out apache config file mode
 #
 # @return   apache config mode (stdout) (see globals below)
-APACHE_CONF_MODE_OLD=1 # *.conf goes to ${APACHE_CONF}/conf.d
-APACHE_CONF_MODE_NEW=2 # *.conf goes to ${APACHE_CONF}/conf-available
+APACHE_CONF_MODE_CONFD=1     # *.conf goes to ${APACHE_CONF}/conf.d
+APACHE_CONF_MODE_CONFAVAIL=2 # *.conf goes to ${APACHE_CONF}/conf-available
 get_apache_conf_mode() {
-  local minor_apache_version=$(version_minor "$(get_apache_version)")
-  if [ $minor_apache_version -ge 4 ] || [ -d /etc/${APACHE_CONF}/conf-available ]; then
-    echo $APACHE_CONF_MODE_NEW
-  else
-    echo $APACHE_CONF_MODE_OLD
-  fi
+  [ -d /etc/${APACHE_CONF}/conf-available ] && echo $APACHE_CONF_MODE_CONFAVAIL \
+                                            || echo $APACHE_CONF_MODE_CONFD
 }
 
 
@@ -1071,8 +1271,10 @@ get_apache_conf_mode() {
 # @return   the location of apache configuration files (stdout)
 get_apache_conf_path() {
   local res_path="/etc/${APACHE_CONF}"
-  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_CONFAVAIL" ]; then
     echo "${res_path}/conf-available"
+  elif [ -d "${res_path}/modules.d" ]; then
+    echo "${res_path}/modules.d"
   else
     echo "${res_path}/conf.d"
   fi
@@ -1084,7 +1286,8 @@ get_apache_conf_path() {
 #
 # @return   a configuration snippet to allow s'th from all hosts (stdout)
 get_compatible_apache_allow_from_all_config() {
-  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+  local minor_apache_version=$(version_minor "$(get_apache_version)")
+  if [ $minor_apache_version -ge 4 ]; then
     echo "Require all granted"
   else
     local nl='
@@ -1110,7 +1313,7 @@ create_apache_config_file() {
   cat - | sudo tee ${conf_path}/${file_name} > /dev/null || return 1
 
   # the new apache requires the enable the config afterwards
-  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_CONFAVAIL" ]; then
     sudo a2enconf $file_name > /dev/null || return 2
   fi
 
@@ -1129,7 +1332,7 @@ remove_apache_config_file() {
   conf_path="$(get_apache_conf_path)/${file_name}"
 
   # disable configuration on newer apache versions
-  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_NEW" ]; then
+  if [ x"$(get_apache_conf_mode)" = x"$APACHE_CONF_MODE_CONFAVAIL" ]; then
     sudo a2disconf $file_name > /dev/null 2>&1 || return 1
   fi
 
@@ -1138,9 +1341,23 @@ remove_apache_config_file() {
 }
 
 
+get_hash_path() {
+  local object_hash="$1"
+  local object_path="$(echo -n $object_hash | sed -e 's/^\(..\)\(.*\)$/\1\/\2/')"
+  echo "${object_path}"
+}
+
 get_local_repo_storage() {
   local repo_name="$1"
   echo "/srv/cvmfs/${repo_name}"
+}
+
+get_local_repo_object() {
+  local repo_name="$1"
+  local object_hash="$2"
+  local repo_storage="$(get_local_repo_storage $repo_name)"
+  local object_path="$(get_hash_path $object_hash)"
+  echo "${repo_storage}/data/${object_path}"
 }
 
 get_local_repo_url() {
@@ -1169,7 +1386,7 @@ get_object_url() {
   local repo_name="$1"
   local object_hash="$2"
   local repo_url="$(get_repo_url $repo_name)"
-  local object_path="$(echo -n $object_hash | sed -e 's/^\(..\)\(.*\)$/\1\/\2/')"
+  local object_path="$(get_hash_path $object_hash)"
   echo "${repo_url}/data/${object_path}"
 }
 
@@ -1300,6 +1517,15 @@ make_path() {
 }
 
 
+peek_backend_raw() {
+  local repo_name="$1"
+  local remote_path="$2"
+
+  load_repo_config $repo_name
+  cvmfs_swissknife peek -d $remote_path -r $CVMFS_UPSTREAM_STORAGE
+}
+
+
 # peeks in the upstream storage to find a given content hash
 #
 # @param repository     the repository name to be queried
@@ -1308,10 +1534,84 @@ make_path() {
 peek_backend() {
   local repo_name="$1"
   local content_hash="$2"
-  local remote_path=$(make_path $content_hash)
+
+  peek_backend_raw $repo_name $(make_path $content_hash)
+}
+
+
+# downloads a random file from the backend storage of a CVMFS repository
+#
+# @param repository   the repository name to uploaded into
+# @param remote_path  the relative remote path to be uploaded into
+# @param local_path   the destination path to be downloaded into
+download_from_backend() {
+  local repo_name="$1"
+  local remote_path="$2"
+  local local_path="$3"
 
   load_repo_config $repo_name
-  cvmfs_swissknife peek -d $remote_path -r $CVMFS_UPSTREAM_STORAGE
+  curl -o $local_path -s "$(get_repo_url $repo_name)/${remote_path}"
+}
+
+
+# removes a random file from the backend storage of a CVMFS repository
+#
+# @param repository   the repository name to uploaded into
+# @param remote_path  the relative remote path to be uploaded into
+delete_from_backend() {
+  local repo_name="$1"
+  local remote_path="$2"
+
+  load_repo_config $repo_name
+  cvmfs_swissknife remove -o $remote_path -r $CVMFS_UPSTREAM_STORAGE
+}
+
+
+# uploads a random file into the backend storage of a CVMFS repository
+#
+# @param repository   the repository name to uploaded into
+# @param file_path    the file to be uploaded
+# @param remote_path  the relative remote path to be uploaded into
+upload_into_backend() {
+  local repo_name="$1"
+  local file_path="$2"
+  local remote_path="$3"
+
+  load_repo_config $repo_name
+
+  if [ x"$(echo "$CVMFS_UPSTREAM_STORAGE" | cut -f1 -d',')" = x"S3" ]; then
+    delete_from_backend $repo_name $remote_path # S3 does a lazy upload
+  fi
+  cvmfs_swissknife upload -i $file_path              \
+                          -o $remote_path            \
+                          -r $CVMFS_UPSTREAM_STORAGE \
+                          -a $CVMFS_HASH_ALGORITHM
+}
+
+
+# downloads and decompresses a backend object from a given repository
+# @param repo_name   the repository to download the root catalog from
+# @param object_hash the object to be downloaded and decompressed
+# @return            prints the file name of the extracted catalog to stdout
+download_and_decompress_object() {
+  local repo_name="$1"
+  local object_hash="$2"
+  local object_url="$(get_object_url $repo_name $object_hash)"
+  local destination="${object_hash}.uncompressed"
+
+  curl --silent                 \
+       --show-error $object_url \
+    | cvmfs_swissknife zpipe -d > $destination || return 1
+
+  echo $destination
+}
+
+
+# reads the upstream config part of a CernVM-FS server configuration file
+# This is the third comma-separated field in the upstream string
+read_upstream_config() {
+  local upstream_string="$1"
+  echo "$upstream_string" | cut -f3 -d','
 }
 
 
@@ -1334,6 +1634,34 @@ toggle_gc() {
   return 0
 }
 
+
+get_object_from_manifest() {
+  local name=$1
+  local type=$2
+
+  local url="http://localhost/cvmfs/$name"
+  hash=$(cvmfs_swissknife info -r $url -R | grep "^$type" | tr -d $type)
+  echo "${hash}${type}"
+}
+
+
+set_auto_tag_timespan() {
+  local name=$1
+  local timespan="$2"
+
+  local cfg_file="/etc/cvmfs/repositories.d/${name}/server.conf"
+  local tmp_file="$(mktemp)"
+
+  cat "$cfg_file" > "$tmp_file" || return 1
+  cat >> $tmp_file << EOF
+CVMFS_AUTO_TAG_TIMESPAN="$timespan"
+EOF
+  sudo cp $tmp_file $cfg_file || return 2
+  rm -f $tmp_file
+  return 0
+}
+
+
 # disables the automatic garbage collection of a given repository configuration
 #
 # @param name  the name of the repository to reconfigure
@@ -1345,6 +1673,7 @@ disable_auto_garbage_collection() {
     local tmp_cfg="$(mktemp)"
     cat $cfg_file | sed -e 's/^\(CVMFS_AUTO_GC\)=.*$/\1=false/' > $tmp_cfg || return 1
     sudo mv -f $tmp_cfg $cfg_file || return 2
+    sudo chmod 0644 $cfg_file     || return 3
   fi
 }
 
@@ -1404,6 +1733,10 @@ benchmark_log() {
 
 # waits until cvmfs is mounted
 wait_fqrn_mount() {
+  if [ x$PARROT_ENABLED = "xTRUE" ]; then
+    return 0
+  fi
+
   local waits=0
   while ! mount | grep -q "/cvmfs/${FQRN}"; do
     waits=$(( waits + 1 ))
@@ -1515,7 +1848,7 @@ setup_benchmark_environment() {
   if [ -z "$CVMFS_OPT_CONFIG_FILE" ]; then
     create_default_cvmfs_config $workspace
   else
-    cp -f "$CVMFS_OPT_CONFIG_FILE" $workspace
+    cp -f "$CVMFS_OPT_CONFIG_FILE" $workspace/cvmfs.conf
   fi
 
   return 0
@@ -1616,6 +1949,15 @@ execute_statistics_loop() {
     wait_fqrn_mount
     statistics_daemon $memory_file $PID >/dev/null 2>&1 & # it kills himself when there is no cvmfs process
 
+    if [ x"$CVMFS_OPT_HOT_CACHE" = x"yes" ]; then
+      benchmark_log "Starting early execution to fill the cache"
+      ( cvmfs_run_benchmark ) > /dev/null 2>&1
+      local code=$?
+      if [ $code -ne 0 ]; then
+        die "Failed in the hot cache execution"
+      fi
+    fi
+
     for i in $(seq 1 1 $CVMFS_OPT_PARALLEL_RUNS); do
       ( cvmfs_run_benchmark ) > /tmp/$FQRN.log.$i 2>&1 &
       processes[$i]=$!
@@ -1655,6 +1997,11 @@ execute_benchmark_loop() {
   local iteration=1
   local code=0
   local count=$CVMFS_OPT_ITERATIONS
+
+  if [ "x$PARROT_ENABLED" = "xTRUE" ]; then
+    benchmark_log "Valgrind is not available with Parrot"
+    exit 100
+  fi
 
   valgrind $OPTIONS cvmfs2 -f -o config=cvmfs.conf,disable_watchdog,simple_options_parsing $FQRN /cvmfs/$FQRN &
   PID=$!
@@ -1803,7 +2150,7 @@ EOF
     cat >> $xml_file << EOF
     <testcase name="$test_name" status="run" time="$(milliseconds_to_seconds $t_elapsed)" classname="$CVMFS_TEST_CLASS_NAME">
       <failure message="Failed with Retval $retval" type="">
-      <![CDATA[$(head -n $log_end $logfile | tail -n $log_length)]]>
+      <![CDATA[$(head -n $log_end $logfile | tail -n $log_length | sed 's/[[:cntrl:]]//g')]]>
       </failure>
     </testcase>
 EOF
@@ -1837,11 +2184,14 @@ get_cache_directory() {
   echo "${mountpoint}c"
 }
 
-do_local_mount() {
-  local mountpoint="$1"
-  local repo_name="$2"
-  local repo_url="$3"
-  local config_file="$4"
+__do_local_mount() {
+  local as_root="$1"
+  local mountpoint="$2"
+  local repo_name="$3"
+  local repo_url="$4"
+  local config_file="$5"
+  local extra_option="$6"
+
   local cache="$(get_cache_directory $mountpoint)"
   local config="$(mktemp ${mountpoint}.conf.XXXXX)"
   local output="$(mktemp ${mountpoint}.log.XXXXX)"
@@ -1849,18 +2199,35 @@ do_local_mount() {
   mkdir $mountpoint $cache
   if [ -z $config_file ]; then
     cat > $config << EOF
+CVMFS_MOUNT_DIR=/cvmfs
 CVMFS_CACHE_BASE=$cache
 CVMFS_RELOAD_SOCKETS=$cache
 CVMFS_SERVER_URL=$repo_url
 CVMFS_HTTP_PROXY=DIRECT
 CVMFS_PUBLIC_KEY=/etc/cvmfs/keys/${repo_name}.pub
 CVMFS_KCACHE_TIMEOUT=15
+CVMFS_DEBUGLOG=$output
 EOF
   else
     cat $config_file > $config
   fi
+  echo "$extra_option" >> $config
+  echo "  *** local mount config:"
+  cat "$config"
 
-  cvmfs2 -d -o config=$config $repo_name $mountpoint >> $output 2>&1
+  if [ x"$as_root" != x"" ]; then
+    sudo cvmfs2 -d -o allow_other,config=$config $repo_name $mountpoint >> $output 2>&1
+  else
+    cvmfs2 -d -o allow_other,config=$config $repo_name $mountpoint >> $output 2>&1
+  fi
+}
+
+do_local_mount() {
+  __do_local_mount "" "$@"
+}
+
+do_local_mount_as_root() {
+  __do_local_mount "sudo" "$@"
 }
 
 remove_local_mount() {
@@ -1870,3 +2237,213 @@ remove_local_mount() {
   sudo umount $mountpoint
   rm -fR $cache $mountpoint
 }
+
+get_internal_value() {
+  local repo=$1
+  local key=$2
+
+  echo $(sudo cvmfs_talk -i $repo internal affairs | grep "^$key" | cut -d\| -f2)
+}
+
+purge_disk_cache() {
+  if running_on_osx; then
+    sudo purge
+  else
+    sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
+  fi
+}
+
+try_automount() {
+  local repo=$1
+  if running_on_osx; then
+    mount | grep "$repo" || sudo mount -t cvmfs $repo /cvmfs/$repo >/dev/null 2>&1
+  else
+    ls /cvmfs/${repo}
+  fi
+}
+
+# figures out where syslog is found on this system and prints it to stdout
+# If $CVMFS_TEST_SYSLOG_TARGET is set, additionally to the system's syslog the
+# path `cat $CVMFS_TEST_SYSLOG_TARGET` is sent to stdout
+# Note: This function also `cat`s all file paths that are additionally passed to
+#       it - appending the default syslog
+#
+# @param optional  a list of files that should be appended to stdout
+cat_syslog() {
+  local syslog_file=""
+  if [ -f "/var/log/syslog" ]; then
+    syslog_file="/var/log/syslog"
+  elif [ -f "/var/log/messages" ]; then
+    syslog_file="/var/log/messages"
+  elif [ -f "/var/log/system.log" ]; then
+    syslog_file="/var/log/system.log"
+  fi
+
+  local cat_retval=0
+  if [ x"$syslog_file" != x"" ]; then
+    sudo cat $syslog_file || cat_retval=$?
+  elif which journalctl > /dev/null 2>&1; then
+    sudo journalctl || cat_retval=$?
+  else
+    echo "default syslog not found on this system"
+    cat_retval=1
+  fi
+
+  if [ x"$CVMFS_TEST_SYSLOG_TARGET" != x"" ]; then
+    sudo cat $CVMFS_TEST_SYSLOG_TARGET || cat_retval=$?
+  fi
+
+  if [ $# -gt 0 ]; then
+    sudo cat $@ || cat_retval=$?
+  fi
+
+  return $cat_retval
+}
+
+
+# look for the `cvmfs_preload` binary both installed in $PATH and
+# pre-built in /tmp. If both lookups fail, try to build it from
+# the provided source tree
+#
+# @param cvmfs_source_dir  absolute path to a CernVM-FS source tree
+# @return                  location of `cvmfs_preload` or retval 1
+find_or_build_cvmfs_preload() {
+  local cvmfs_source_dir="$1"
+  local cvmfs_preload_build_dir="/tmp/cvmfs_test_preload_build"
+  local cvmfs_preload_build_log="${cvmfs_preload_build_dir}/build.log"
+  local cvmfs_preload_path=
+
+  # check if cvmfs_preload is readily available (i.e. installed in $PATH)
+  if which cvmfs_preload > /dev/null 2>&1; then
+    which cvmfs_preload
+    return 0
+  fi
+
+  # check if cvmfs_preload has been built before
+  if [ -x ${cvmfs_preload_build_dir}/cvmfs/cvmfs_preload ]; then
+    echo "${cvmfs_preload_build_dir}/cvmfs/cvmfs_preload"
+    return 0
+  fi
+
+  # build cvmfs_preload from source $cvmfs_source_dir
+  rm -fR   $cvmfs_preload_build_dir > /dev/null 2>&1 || return 1
+  mkdir -p $cvmfs_preload_build_dir > /dev/null 2>&1 || return 2
+  pushdir  $cvmfs_preload_build_dir > /dev/null 2>&1 || return 3
+
+  cmake -DBUILD_PRELOADER=yes      \
+        -DBUILD_SERVER=no          \
+        -DBUILD_SERVER_DEBUG=no    \
+        -DBUILD_CVMFS=no           \
+        -DBUILD_UNITTESTS=no       \
+        -DBUILD_UNITTESTS_DEBUG=no \
+        -DBUILD_LIBCVMFS=no        \
+        -DINSTALL_MOUNT_SCRIPTS=no \
+        -DBUILD_DOCUMENTATION=no   \
+        $cvmfs_source_dir > $cvmfs_preload_build_log 2>&1 || return 4
+  make -j $(nproc)        > $cvmfs_preload_build_log 2>&1 || return 5
+
+  popdir > /dev/null 2>&1
+
+  # check (again) if cvmfs_preload has been built properly and return
+  if [ -x ${cvmfs_preload_build_dir}/cvmfs/cvmfs_preload ]; then
+    echo "${cvmfs_preload_build_dir}/cvmfs/cvmfs_preload"
+    return 0
+  fi
+
+  return 1
+}
+
+
+#####################################
+##### CVMFS Repository Services #####
+#####################################
+
+
+# Sets up the CVMFS repository services application
+set_up_repository_services() {
+    echo "Setting up repository services"
+
+    local package_url_root=$CVMFS_SERVICES_URL
+
+    # Choose which package to download and install based on platform
+    if [ -f /etc/debian_version ]; then
+        if [ x"$(lsb_release -cs)" = x"xenial" ]; then
+            package_map_url=${package_url_root}/pkgmap/pkgmap.ubuntu1604_x86_64
+        fi
+    elif is_el6; then
+        package_map_url=${package_url_root}/pkgmap/pkgmap.slc6_x86_64
+    elif is_el7; then
+        package_map_url=${package_url_root}/pkgmap/pkgmap.cc7_x86_64
+    fi
+
+    if [ x"$package_map_url" = x"" ]; then
+        echo "Platform not supported. Exiting"
+        exit 1
+    fi
+
+    echo "  Installing the cvmfs_services application"
+    pushd /tmp
+
+    echo "Package map URL: ${package_map_url}"
+    curl -o package_map $package_map_url
+
+    local cvmfs_services_package_url=${package_url_root}/$(tail -1 package_map | cut -d'=' -f2)
+    echo "    Using package: $cvmfs_services_package_url"
+
+    local cvmfs_services_package_file_name=$(echo $cvmfs_services_package_url | awk -F'/' {'print $NF'})
+
+    if [ ! -f "/tmp/$cvmfs_services_package_file_name" ]; then
+        curl -o $cvmfs_services_package_file_name $cvmfs_services_package_url
+    fi
+    sudo rm -rf /opt/cvmfs_services && sudo mkdir -p /opt/cvmfs_services && cd /opt/cvmfs_services
+    sudo tar xzf /tmp/$cvmfs_services_package_file_name
+    popd
+
+    echo "  Writing configuration files"
+    sudo bash -c 'cat <<EOF > /opt/cvmfs_services/etc/repo.config
+{repos, [{<<"test.repo.org">>, [<<"key1">>]}]}.
+{keys, [{file, "/etc/cvmfs/keys/test.repo.org.gw"}]}.
+EOF'
+
+    echo "  Writing API key file"
+    sudo bash -c 'cat <<EOF > /etc/cvmfs/keys/test.repo.org.gw
+test key1 secret1
+EOF'
+
+    echo "  Creating Mnesia schema"
+    sudo mkdir -p /opt/cvmfs_mnesia
+    sudo chown `whoami`:`whoami` /opt/cvmfs_mnesia
+    cd /opt/cvmfs_services
+    ./scripts/setup.sh
+
+    echo "  Creating test repo"
+    sudo -E cvmfs_server mkfs -o `whoami` test.repo.org
+
+    echo "  Modifying test repo configuration"
+    sudo sed -i -e 's/local,/gw,/' /etc/cvmfs/repositories.d/test.repo.org/server.conf
+    sudo sed -i -e 's/txn,\/srv\/cvmfs\/test.repo.org/txn,http:\/\/localhost:8080\/api\/v1/g' /etc/cvmfs/repositories.d/test.repo.org/server.conf
+    sudo bash -c 'echo "TEST_CVMFS_RECEIVER_UPSTREAM_STORAGE=local,/srv/cvmfs/test.repo.org/data/txn,/srv/cvmfs/test.repo.org" >> /etc/cvmfs/repositories.d/test.repo.org/server.conf'
+    sudo sed -i -e "s/CVMFS_ROOT_HASH=.*//" /var/spool/cvmfs/test.repo.org/client.local
+
+    echo "  Starting repository services application"
+    /opt/cvmfs_services/scripts/run_cvmfs_services.sh start
+
+    # Waiting here is necessary in order to give the cvmfs_services application enough time to boot
+    wait_for_app_start
+}
+
+wait_for_app_start() {
+    local reply=$(/opt/cvmfs_services/bin/cvmfs_services ping | awk {'print $1'})
+    local num_iter=1
+    while [ $reply != "pong" ]; do
+        sleep 1
+        reply=$(/opt/cvmfs_services/bin/cvmfs_services ping | awk {'print $1'})
+        echo "Num iter: $num_iter"
+        num_iter=$((num_iter + 1))
+        if [ $num_iter -eq 10 ]; then
+            break;
+        fi
+    done
+    echo $reply
+}
+

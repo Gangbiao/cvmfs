@@ -9,9 +9,9 @@
 
 #include <limits>
 
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/murmur.h"
-#include "../../cvmfs/smallhash.h"
+#include "hash.h"
+#include "murmur.h"
+#include "smallhash.h"
 
 static uint32_t hasher_int(const int &key) {
   return MurmurHash2(&key, sizeof(key), 0x07387a4f);
@@ -159,7 +159,7 @@ TEST_F(T_Smallhash, Lookup) {
     smallhash_.Insert(i, i);
   }
   for (unsigned i = 0; i < N; ++i) {
-    int value;
+    int value = -1;
     bool found = smallhash_.Lookup(i, &value);
     EXPECT_TRUE(found);
     EXPECT_EQ(unsigned(value), i);
@@ -174,7 +174,7 @@ TEST_F(T_Smallhash, MultihashCycleSlow) {
   }
   EXPECT_EQ(N, GetMultiSize());
   for (unsigned i = 0; i < N; ++i) {
-    int value;
+    int value = -1;
     bool found = multihash_.Lookup(i, &value);
     EXPECT_TRUE(found);
     EXPECT_EQ(unsigned(value), i);

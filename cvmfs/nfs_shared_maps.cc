@@ -29,7 +29,8 @@
 #include "duplex_sqlite3.h"
 #include "logging.h"
 #include "prng.h"
-#include "util.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -197,7 +198,7 @@ bool GetPath(const uint64_t inode, PathString *path) {
   }
   if (sqlite_state != SQLITE_ROW) {
     LogCvmfs(kLogNfsMaps, kLogSyslogErr,
-             "Failed to execute SQL for GetPath (%"PRIu64"): %s",
+             "Failed to execute SQL for GetPath (%" PRIu64 "): %s",
              inode, sqlite3_errmsg(db_));
     pthread_mutex_unlock(&lock_);
     abort();

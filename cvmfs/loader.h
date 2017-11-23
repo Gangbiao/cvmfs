@@ -20,6 +20,10 @@ namespace loader {
 
 extern std::string *usyslog_path_;
 
+/**
+ * Possible failures when booting/mounting cvmfs.  Remember to add a constant
+ * to libcvmfs.h and libcvmfs_legacy.cc when a constant to this enum is added.
+ */
 enum Failures {
   kFailOk = 0,
   kFailUnknown,
@@ -45,6 +49,8 @@ enum Failures {
   kFailDoubleMount,
   kFailHistory,
   kFailWpad,
+  kFailLockWorkspace,
+  kFailRevisionBlacklisted,
 
   kFailNumEntries
 };
@@ -60,7 +66,7 @@ inline const char *Code2Ascii(const Failures error) {
   texts[6] = "cannot run FUSE event loop";
   texts[7] = "failed to load shared library";
   texts[8] = "incompatible library version";
-  texts[9] = "cache directory problem";
+  texts[9] = "cache directory/plugin problem";
   texts[10] = "peering problem";
   texts[11] = "NFS maps init failure";
   texts[12] = "quota init failure";
@@ -75,7 +81,9 @@ inline const char *Code2Ascii(const Failures error) {
   texts[21] = "double mount";
   texts[22] = "history init failure";
   texts[23] = "proxy auto-discovery failed";
-  texts[24] = "no text";
+  texts[24] = "workspace already locked";
+  texts[25] = "revision blacklisted";
+  texts[26] = "no text";
   return texts[error];
 }
 
@@ -83,15 +91,19 @@ inline const char *Code2Ascii(const Failures error) {
 enum StateId {
   kStateUnknown = 0,
   kStateOpenDirs,           // >= 2.1.4
-  kStateOpenFiles,          // >= 2.1.4, used as of 2.1.15
+  kStateOpenChunks,         // >= 2.1.4, used as of 2.1.15
   kStateGlueBuffer,         // >= 2.1.9
   kStateInodeGeneration,    // >= 2.1.9
   kStateOpenFilesCounter,   // >= 2.1.9
   kStateGlueBufferV2,       // >= 2.1.10
   kStateGlueBufferV3,       // >= 2.1.15
   kStateGlueBufferV4,       // >= 2.1.20
-  kStateOpenFilesV2,        // >= 2.1.20
-  kStateOpenFilesV3,        // >= 2.2.0
+  kStateOpenChunksV2,       // >= 2.1.20
+  kStateOpenChunksV3,       // >= 2.2.0
+  kStateOpenChunksV4,       // >= 2.2.3
+  kStateOpenFiles           // >= 2.4
+
+  // Note: kStateOpenFilesXXX was renamed to kStateOpenChunksXXX as of 2.4
 };
 
 
@@ -135,12 +147,18 @@ typedef std::vector<LoadEvent *> EventList;
  *
  * CernVM-FS 2.1.8 --> Version 2
  * CernVM-FS 2.2.0 --> Version 3
+ * CernVM-FS 2.4.0 --> Version 4
  */
 struct LoaderExports {
   LoaderExports() :
-    version(3),
-    size(sizeof(LoaderExports)), boot_time(0), foreground(false),
-    disable_watchdog(false), simple_options_parsing(false) {}
+    version(4),
+    size(sizeof(LoaderExports)),
+    boot_time(0),
+    foreground(false),
+    disable_watchdog(false),
+    simple_options_parsing(false),
+    fuse_channel(NULL)
+  { }
 
   ~LoaderExports() {
     for (unsigned i = 0; i < history.size(); ++i)
@@ -164,6 +182,9 @@ struct LoaderExports {
 
   // added with CernVM-FS 2.2.0 (LoaderExports Version: 3)
   bool simple_options_parsing;
+
+  // added with CernVM-FS 2.4.0 (LoaderExports Version: 4)
+  struct fuse_chan **fuse_channel;
 };
 
 

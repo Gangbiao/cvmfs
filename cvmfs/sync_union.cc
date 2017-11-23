@@ -17,7 +17,6 @@
 #include "logging.h"
 #include "platform.h"
 #include "sync_mediator.h"
-#include "util.h"
 
 using namespace std;  // NOLINT
 
@@ -46,6 +45,10 @@ SyncItem SyncUnion::CreateSyncItem(const std::string  &relative_parent_path,
                                    const SyncItemType  entry_type) const {
   SyncItem entry(relative_parent_path, filename, this, entry_type);
   PreprocessSyncItem(&entry);
+  if (entry_type == kItemFile) {
+    entry.SetExternalData(mediator_->IsExternalData());
+    entry.SetCompressionAlgorithm(mediator_->GetCompressionAlgorithm());
+  }
   return entry;
 }
 
@@ -55,9 +58,15 @@ void SyncUnion::PreprocessSyncItem(SyncItem *entry) const {
     entry->MarkAsWhiteout(UnwindWhiteoutFilename(*entry));
   }
 
-  if (IsOpaqueDirectory(*entry)) {
+  if (entry->IsDirectory() && IsOpaqueDirectory(*entry)) {
     entry->MarkAsOpaqueDirectory();
   }
+}
+
+
+bool SyncUnion::IgnoreFilePredicate(const std::string &parent_dir,
+                                    const std::string &filename) {
+  return false;
 }
 
 
@@ -140,6 +149,23 @@ void SyncUnion::LeaveDirectory(const string &parent_dir,
   mediator_->LeaveDirectory(entry);
 }
 
+void SyncUnion::ProcessCharacterDevice(const std::string &parent_dir,
+                                        const std::string &filename) {
+  LogCvmfs(kLogUnionFs, kLogDebug,
+            "SyncUnionOverlayfs::ProcessCharacterDevice(%s, %s)",
+            parent_dir.c_str(), filename.c_str());
+  SyncItem entry = CreateSyncItem(parent_dir, filename, kItemCharacterDevice);
+  ProcessFile(entry);
+}
+
+void SyncUnion::ProcessBlockDevice(const std::string &parent_dir,
+                                    const std::string &filename) {
+  LogCvmfs(kLogUnionFs, kLogDebug,
+            "SyncUnionOverlayfs::ProcessBlockDevice(%s, %s)",
+            parent_dir.c_str(), filename.c_str());
+  SyncItem entry = CreateSyncItem(parent_dir, filename, kItemBlockDevice);
+  ProcessFile(entry);
+}
 
 //------------------------------------------------------------------------------
 
@@ -167,12 +193,18 @@ void SyncUnionAufs::Traverse() {
 
   FileSystemTraversal<SyncUnionAufs> traversal(this, scratch_path(), true);
 
-  traversal.fn_enter_dir      = &SyncUnionAufs::EnterDirectory;
-  traversal.fn_leave_dir      = &SyncUnionAufs::LeaveDirectory;
-  traversal.fn_new_file       = &SyncUnionAufs::ProcessRegularFile;
-  traversal.fn_ignore_file    = &SyncUnionAufs::IgnoreFilePredicate;
-  traversal.fn_new_dir_prefix = &SyncUnionAufs::ProcessDirectory;
-  traversal.fn_new_symlink    = &SyncUnionAufs::ProcessSymlink;
+  traversal.fn_enter_dir          = &SyncUnionAufs::EnterDirectory;
+  traversal.fn_leave_dir          = &SyncUnionAufs::LeaveDirectory;
+  traversal.fn_new_file           = &SyncUnionAufs::ProcessRegularFile;
+  traversal.fn_ignore_file        = &SyncUnionAufs::IgnoreFilePredicate;
+  traversal.fn_new_dir_prefix     = &SyncUnionAufs::ProcessDirectory;
+  traversal.fn_new_symlink        = &SyncUnionAufs::ProcessSymlink;
+  traversal.fn_new_character_dev  = &SyncUnionAufs::ProcessCharacterDevice;
+  traversal.fn_new_block_dev      = &SyncUnionAufs::ProcessBlockDevice;
+  LogCvmfs(kLogUnionFs, kLogVerboseMsg, "Aufs starting traversal "
+           "recursion for scratch_path=[%s] with external data set to %d",
+           scratch_path().c_str(),
+           mediator_->IsExternalData());
 
   traversal.Recurse(scratch_path());
 }
@@ -198,7 +230,8 @@ string SyncUnionAufs::UnwindWhiteoutFilename(const SyncItem &entry) const {
 bool SyncUnionAufs::IgnoreFilePredicate(const string &parent_dir,
                                         const string &filename)
 {
-  return (ignore_filenames_.find(filename) != ignore_filenames_.end());
+  return SyncUnion::IgnoreFilePredicate(parent_dir, filename) ||
+         (ignore_filenames_.find(filename) != ignore_filenames_.end());
 }
 
 
@@ -253,7 +286,7 @@ bool ObtainSysAdminCapabilityInternal(cap_t caps) {
   }
 
   if (cap_state == CAP_SET) {
-    LogCvmfs(kLogUnionFs, kLogStderr, "CAP_SYS_ADMIN is already effective");
+    LogCvmfs(kLogUnionFs, kLogDebug, "CAP_SYS_ADMIN is already effective");
     return true;
   }
 
@@ -299,7 +332,9 @@ bool SyncUnionOverlayfs::ObtainSysAdminCapability() const {
 
 void SyncUnionOverlayfs::PreprocessSyncItem(SyncItem *entry) const {
   SyncUnion::PreprocessSyncItem(entry);
-  if (entry->IsWhiteout() || entry->IsDirectory()) {
+  if (entry->IsGraftMarker() || entry->IsWhiteout()
+      || entry->IsDirectory() || entry->IsSpecialFile())
+  {
     return;
   }
 
@@ -346,6 +381,7 @@ void SyncUnionOverlayfs::Traverse() {
   traversal.fn_leave_dir          = &SyncUnionOverlayfs::LeaveDirectory;
   traversal.fn_new_file           = &SyncUnionOverlayfs::ProcessRegularFile;
   traversal.fn_new_character_dev  = &SyncUnionOverlayfs::ProcessCharacterDevice;
+  traversal.fn_new_block_dev      = &SyncUnionOverlayfs::ProcessBlockDevice;
   traversal.fn_ignore_file        = &SyncUnionOverlayfs::IgnoreFilePredicate;
   traversal.fn_new_dir_prefix     = &SyncUnionOverlayfs::ProcessDirectory;
   traversal.fn_new_symlink        = &SyncUnionOverlayfs::ProcessSymlink;
@@ -425,8 +461,13 @@ bool SyncUnionOverlayfs::IsWhiteoutEntry(const SyncItem &entry) const {
    * 1. whiteouts are 'character device' files
    * 2. whiteouts are symlinks pointing to '(overlay-whiteout)'
    */
-  return entry.IsCharacterDevice() ||
-        (entry.IsSymlink() && IsWhiteoutSymlinkPath(entry.GetScratchPath()));
+  bool is_chardev_whiteout = entry.IsCharacterDevice() &&
+    entry.GetRdevMajor() == 0 && entry.GetRdevMinor() == 0;
+
+  bool is_symlink_whiteout = entry.IsSymlink() &&
+    IsWhiteoutSymlinkPath(entry.GetScratchPath());
+
+  return is_chardev_whiteout || is_symlink_whiteout;
 }
 
 
@@ -464,22 +505,4 @@ bool SyncUnionOverlayfs::IsOpaqueDirPath(const string &path) const {
 string SyncUnionOverlayfs::UnwindWhiteoutFilename(const SyncItem &entry) const {
   return entry.filename();
 }
-
-
-bool SyncUnionOverlayfs::IgnoreFilePredicate(const string &parent_dir,
-                                             const string &filename)
-{
-  // no files need to be ignored for OverlayFS
-  return false;
-}
-
-void SyncUnionOverlayfs::ProcessCharacterDevice(const std::string &parent_dir,
-                                                const std::string &filename) {
-  LogCvmfs(kLogUnionFs, kLogDebug,
-           "SyncUnionOverlayfs::ProcessCharacterDevice(%s, %s)",
-           parent_dir.c_str(), filename.c_str());
-  SyncItem entry = CreateSyncItem(parent_dir, filename, kItemCharacterDevice);
-  ProcessFile(entry);
-}
-
 }  // namespace publish

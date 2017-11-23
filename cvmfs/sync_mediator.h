@@ -33,6 +33,8 @@
 #include <vector>
 
 #include "catalog_mgr_rw.h"
+#include "compression.h"
+#include "file_chunk.h"
 #include "platform.h"
 #include "swissknife_sync.h"
 #include "sync_item.h"
@@ -61,6 +63,7 @@ struct HardlinkGroup {
 
   SyncItem master;
   SyncItemList hardlinks;
+  FileChunkList file_chunks;
 };
 
 /**
@@ -79,22 +82,12 @@ typedef std::map<uint64_t, HardlinkGroup> HardlinkGroupMap;
  * and hashing.
  */
 class SyncMediator {
-  friend class SyncUnion;
- private:
-  enum ChangesetAction {
-    kAdd,
-    kAddCatalog,
-    kAddHardlinks,
-    kTouch,
-    kRemove,
-    kRemoveCatalog
-  };
-
  public:
   static const unsigned int processing_dot_interval = 100;
 
   SyncMediator(catalog::WritableCatalogManager *catalog_manager,
                const SyncParameters *params);
+  void RegisterUnionEngine(SyncUnion *engine);
   virtual ~SyncMediator();
 
   void Add(const SyncItem &entry);
@@ -105,16 +98,32 @@ class SyncMediator {
   void EnterDirectory(const SyncItem &entry);
   void LeaveDirectory(const SyncItem &entry);
 
-  manifest::Manifest *Commit();
+  bool Commit(manifest::Manifest *manifest);
+
+  // The sync union engine uses this information to create properly initialized
+  // sync items
+  bool IsExternalData() const { return params_->external_data; }
+  zlib::Algorithms GetCompressionAlgorithm() const {
+    return params_->compression_alg;
+  }
 
  private:
+  enum ChangesetAction {
+    kAdd,
+    kAddCatalog,
+    kAddHardlinks,
+    kTouch,
+    kRemove,
+    kRemoveCatalog
+  };
+
   typedef std::stack<HardlinkGroupMap> HardlinkGroupMapStack;
   typedef std::vector<HardlinkGroup> HardlinkGroupList;
 
-  void RegisterUnionEngine(SyncUnion *engine);
-
   void PrintChangesetNotice(const ChangesetAction action,
                             const std::string &extra_info) const;
+
+  void EnsureAllowed(const SyncItem &entry);
 
   // Called after figuring out the type of a path (file, symlink, dir)
   void AddFile(const SyncItem &entry);
@@ -124,8 +133,8 @@ class SyncMediator {
   void RemoveDirectory(const SyncItem &entry);
   void TouchDirectory(const SyncItem &entry);
 
-  void CreateNestedCatalog(const SyncItem &requestFile);
-  void RemoveNestedCatalog(const SyncItem &requestFile);
+  void CreateNestedCatalog(const SyncItem &directory);
+  void RemoveNestedCatalog(const SyncItem &directory);
 
   // Called by file system traversal
   void EnterAddedDirectoryCallback(const std::string &parent_dir,
@@ -137,6 +146,10 @@ class SyncMediator {
   bool AddDirectoryCallback(const std::string &parent_dir,
                             const std::string &dir_name);
   void AddFileCallback(const std::string &parent_dir,
+                       const std::string &file_name);
+  void AddCharacterDeviceCallback(const std::string &parent_dir,
+                       const std::string &file_name);
+  void AddBlockDeviceCallback(const std::string &parent_dir,
                        const std::string &file_name);
   void AddSymlinkCallback(const std::string &parent_dir,
                           const std::string &link_name);

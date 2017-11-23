@@ -36,7 +36,8 @@ build_config_package() {
   cd ${CVMFS_SOURCE_LOCATION}/debian
 
   echo "running the debian package build ($config_package)..."
-  pdebuild --buildresult ${CVMFS_RESULT_LOCATION}
+  debuild --check-dirname-regex=cvmfs-config --no-tgz-check -us -uc # -us -uc == skip signing
+  mv ${CVMFS_SOURCE_LOCATION}/../cvmfs-config-*_* ${CVMFS_RESULT_LOCATION}/
 
   echo "switching back to the source directory..."
   cd ${CVMFS_SOURCE_LOCATION}
@@ -49,3 +50,4 @@ build_config_package() {
 echo "build the config packages..."
 build_config_package "config-default"
 build_config_package "config-none"
+build_config_package "config-graphdriver"

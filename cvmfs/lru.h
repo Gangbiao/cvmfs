@@ -36,16 +36,9 @@
 #ifndef CVMFS_LRU_H_
 #define CVMFS_LRU_H_
 
-#define FUSE_USE_VERSION 26
-#ifndef __STDC_FORMAT_MACROS
-#define __STDC_FORMAT_MACROS
-#endif
-
 // If defined the cache is secured by a posix mutex
 #define LRU_CACHE_THREAD_SAFE
 
-#include <fuse/fuse_lowlevel.h>
-#include <inttypes.h>
 #include <stdint.h>
 
 #include <algorithm>
@@ -56,16 +49,11 @@
 #include <string>
 
 #include "atomic.h"
-#include "directory_entry.h"
-#include "hash.h"
-#include "logging.h"
-#include "murmur.h"
 #include "platform.h"
-#include "shortstring.h"
 #include "smallhash.h"
 #include "smalloc.h"
 #include "statistics.h"
-#include "util.h"
+#include "util/single_copy.h"
 
 namespace lru {
 
@@ -81,32 +69,30 @@ struct Counters {
   uint64_t num_collisions;
   uint32_t max_collisions;
   perf::Counter *n_update;
+  perf::Counter *n_update_value;
   perf::Counter *n_replace;
   perf::Counter *n_forget;
   perf::Counter *n_drop;
   perf::Counter *sz_allocated;
 
-  Counters(perf::Statistics *statistics, const std::string &name) {
-    sz_size = statistics->Register(name + ".sz_size", "Size for " + name);
+  explicit Counters(perf::StatisticsTemplate statistics) {
+    sz_size = statistics.RegisterTemplated("sz_size", "Total size");
     num_collisions = 0;
     max_collisions = 0;
-    n_hit = statistics->Register(name + ".n_hit", "Number of hits for " + name);
-    n_miss = statistics->Register(name + ".n_miss",
-        "Number of misses for " + name);
-    n_insert = statistics->Register(name + ".n_insert",
-        "Number of inserts for " + name);
-    n_insert_negative = statistics->Register(name + ".n_insert_negative",
-        "Number of negative inserts for " + name);
-    n_update = statistics->Register(name + ".n_update",
-        "Number of updates for " + name);
-    n_replace = statistics->Register(name + ".n_replace",
-        "Number of replaces for " + name);
-    n_forget = statistics->Register(name + ".n_forget",
-        "Number of forgets for " + name);
-    n_drop = statistics->Register(name + ".n_drop",
-        "Number of drops for " + name);
-    sz_allocated = statistics->Register(name + ".sz_allocated",
-        "Number of allocated bytes for " + name);
+    n_hit = statistics.RegisterTemplated("n_hit", "Number of hits");
+    n_miss = statistics.RegisterTemplated("n_miss", "Number of misses");
+    n_insert = statistics.RegisterTemplated("n_insert", "Number of inserts");
+    n_insert_negative = statistics.RegisterTemplated("n_insert_negative",
+        "Number of negative inserts");
+    n_update = statistics.RegisterTemplated("n_update",
+        "Number of updates");
+    n_update_value = statistics.RegisterTemplated("n_update_value",
+        "Number of value changes");
+    n_replace = statistics.RegisterTemplated("n_replace", "Number of replaces");
+    n_forget = statistics.RegisterTemplated("n_forget", "Number of forgets");
+    n_drop = statistics.RegisterTemplated("n_drop", "Number of drops");
+    sz_allocated = statistics.RegisterTemplated("sz_allocated",
+        "Number of allocated bytes ");
   }
 };
 
@@ -305,6 +291,7 @@ class LruCache : SingleCopy {
    * The list keeps track of the least recently used keys in the cache.
    */
   template<class T> class ListEntry {
+  friend class LruCache;
    public:
     /**
      * Create a new list entry as lonely, both next and prev pointing to this.
@@ -522,9 +509,8 @@ class LruCache : SingleCopy {
   LruCache(const unsigned   cache_size,
            const Key       &empty_key,
            uint32_t (*hasher)(const Key &key),
-           perf::Statistics *statistics,
-           const std::string &name) :
-    counters_(statistics, name),
+           perf::StatisticsTemplate statistics) :
+    counters_(statistics),
     pause_(false),
     cache_gauge_(0),
     cache_size_(cache_size),
@@ -534,6 +520,7 @@ class LruCache : SingleCopy {
     assert(cache_size > 0);
 
     counters_.sz_size->Set(cache_size_);
+    filter_entry_ = NULL;
     // cache_ = Cache(cache_size_);
     cache_.Init(cache_size_, empty_key, hasher);
     perf::Xadd(counters_.sz_allocated, allocator_.bytes_allocated() +
@@ -600,6 +587,49 @@ class LruCache : SingleCopy {
     return true;
   }
 
+
+  /**
+   * Updates object and moves back to the end of the list.  The object must be
+   * present.
+   */
+  virtual void Update(const Key &key) {
+    Lock();
+    // Is not called from the client, only from the cache plugin
+    assert(!pause_);
+    CacheEntry entry;
+    bool retval = DoLookup(key, &entry);
+    assert(retval);
+    perf::Inc(counters_.n_update);
+    Touch(entry);
+    Unlock();
+  }
+
+
+  /**
+   * Changes the value of an entry in the LRU cache without updating the LRU
+   * order.
+   */
+  virtual bool UpdateValue(const Key &key, const Value &value) {
+    this->Lock();
+    if (pause_) {
+      Unlock();
+      return false;
+    }
+
+    CacheEntry entry;
+    if (!this->DoLookup(key, &entry)) {
+      this->Unlock();
+      return false;
+    }
+
+    perf::Inc(counters_.n_update_value);
+    entry.value = value;
+    cache_.Insert(key, entry);
+    this->Unlock();
+    return true;
+  }
+
+
   /**
    * Retrieve an element from the cache.
    * If the element was found, it will be marked as 'recently used' and returned
@@ -607,7 +637,7 @@ class LruCache : SingleCopy {
    * @param value (out) here the result is saved (not touch in case of miss)
    * @return true on successful lookup, false if key was not found
    */
-  virtual bool Lookup(const Key &key, Value *value) {
+  virtual bool Lookup(const Key &key, Value *value, bool update_lru = true) {
     bool found = false;
     Lock();
     if (pause_) {
@@ -619,7 +649,8 @@ class LruCache : SingleCopy {
     if (DoLookup(key, &entry)) {
       // Hit
       perf::Inc(counters_.n_hit);
-      Touch(entry);
+      if (update_lru)
+        Touch(entry);
       *value = entry.value;
       found = true;
     } else {
@@ -700,6 +731,67 @@ class LruCache : SingleCopy {
     return counters_;
   }
 
+  /**
+   * Prepares for in-order iteration of the cache entries to perform a filter
+   * operation. To ensure consistency, the LruCache must be locked for the
+   * duration of the filter operation.
+   */
+  virtual void FilterBegin() {
+    assert(!filter_entry_);
+    Lock();
+    filter_entry_ = &lru_list_;
+  }
+
+  /**
+   * Get the current key and value for the filter operation
+   * @param key Address to write the key
+   * @param value Address to write the value
+   */
+  virtual void FilterGet(Key *key, Value *value) {
+    CacheEntry entry;
+    assert(filter_entry_);
+    assert(!filter_entry_->IsListHead());
+    *key = static_cast<ConcreteListEntryContent *>(filter_entry_)->content();
+    bool rc = this->DoLookup(*key, &entry);
+    assert(rc);
+    *value = entry.value;
+  }
+
+  /**
+   * Advance to the next entry in the list
+   * @returns false upon reaching the end of the cache list
+   */
+  virtual bool FilterNext() {
+    assert(filter_entry_);
+    filter_entry_ = filter_entry_->next;
+    return !filter_entry_->IsListHead();
+  }
+
+ /**
+  * Delete the current cache list entry
+  */
+  virtual void FilterDelete() {
+    assert(filter_entry_);
+    assert(!filter_entry_->IsListHead());
+    ListEntry<Key> *new_current = filter_entry_->prev;
+    perf::Inc(counters_.n_forget);
+    Key k = static_cast<ConcreteListEntryContent *>(filter_entry_)->content();
+    filter_entry_->RemoveFromList();
+    allocator_.Destruct(static_cast<ConcreteListEntryContent *>(filter_entry_));
+    cache_.Erase(k);
+    --cache_gauge_;
+    filter_entry_ = new_current;
+  }
+
+ /**
+  * Finish filtering the entries and unlock the cache
+  */
+  virtual void FilterEnd() {
+    assert(filter_entry_);
+    filter_entry_ = NULL;
+    Unlock();
+  }
+
  protected:
   Counters counters_;
 
@@ -772,136 +864,12 @@ class LruCache : SingleCopy {
    */
   ListEntryHead<Key>              lru_list_;
   SmallHashFixed<Key, CacheEntry> cache_;
+
+  ListEntry<Key> *filter_entry_;
 #ifdef LRU_CACHE_THREAD_SAFE
   pthread_mutex_t lock_;  /**< Mutex to make cache thread safe. */
 #endif
 };  // class LruCache
-
-// Hash functions
-static inline uint32_t hasher_md5(const shash::Md5 &key) {
-  // Don't start with the first bytes, because == is using them as well
-  return (uint32_t) *(reinterpret_cast<const uint32_t *>(key.digest) + 1);
-}
-
-static inline uint32_t hasher_inode(const fuse_ino_t &inode) {
-  return MurmurHash2(&inode, sizeof(inode), 0x07387a4f);
-}
-// uint32_t hasher_md5(const shash::Md5 &key);
-// uint32_t hasher_inode(const fuse_ino_t &inode);
-
-
-class InodeCache : public LruCache<fuse_ino_t, catalog::DirectoryEntry>
-{
- public:
-  explicit InodeCache(unsigned int cache_size, perf::Statistics *statistics) :
-    LruCache<fuse_ino_t, catalog::DirectoryEntry>(
-      cache_size, fuse_ino_t(-1), hasher_inode, statistics, "inode_cache")
-  {
-  }
-
-  bool Insert(const fuse_ino_t &inode, const catalog::DirectoryEntry &dirent) {
-    LogCvmfs(kLogLru, kLogDebug, "insert inode --> dirent: %u -> '%s'",
-             inode, dirent.name().c_str());
-    const bool result =
-      LruCache<fuse_ino_t, catalog::DirectoryEntry>::Insert(inode, dirent);
-    return result;
-  }
-
-  bool Lookup(const fuse_ino_t &inode, catalog::DirectoryEntry *dirent) {
-    const bool result =
-      LruCache<fuse_ino_t, catalog::DirectoryEntry>::Lookup(inode, dirent);
-    LogCvmfs(kLogLru, kLogDebug, "lookup inode --> dirent: %u (%s)",
-             inode, result ? "hit" : "miss");
-    return result;
-  }
-
-  void Drop() {
-    LogCvmfs(kLogLru, kLogDebug, "dropping inode cache");
-    LruCache<fuse_ino_t, catalog::DirectoryEntry>::Drop();
-  }
-};  // InodeCache
-
-
-class PathCache : public LruCache<fuse_ino_t, PathString> {
- public:
-  explicit PathCache(unsigned int cache_size, perf::Statistics *statistics) :
-    LruCache<fuse_ino_t, PathString>(cache_size, fuse_ino_t(-1), hasher_inode,
-        statistics, "path_cache")
-  {
-  }
-
-  bool Insert(const fuse_ino_t &inode, const PathString &path) {
-    LogCvmfs(kLogLru, kLogDebug, "insert inode --> path %u -> '%s'",
-             inode, path.c_str());
-    const bool result =
-      LruCache<fuse_ino_t, PathString>::Insert(inode, path);
-    return result;
-  }
-
-  bool Lookup(const fuse_ino_t &inode, PathString *path) {
-    const bool found =
-      LruCache<fuse_ino_t, PathString>::Lookup(inode, path);
-    LogCvmfs(kLogLru, kLogDebug, "lookup inode --> path: %u (%s)",
-             inode, found ? "hit" : "miss");
-    return found;
-  }
-
-  void Drop() {
-    LogCvmfs(kLogLru, kLogDebug, "dropping path cache");
-    LruCache<fuse_ino_t, PathString>::Drop();
-  }
-};  // PathCache
-
-
-class Md5PathCache :
-  public LruCache<shash::Md5, catalog::DirectoryEntry>
-{
- public:
-  explicit Md5PathCache(unsigned int cache_size, perf::Statistics *statistics) :
-    LruCache<shash::Md5, catalog::DirectoryEntry>(
-      cache_size, shash::Md5(shash::AsciiPtr("!")), hasher_md5, statistics,
-      "md5_path_cache")
-  {
-    dirent_negative_ = catalog::DirectoryEntry(catalog::kDirentNegative);
-  }
-
-  bool Insert(const shash::Md5 &hash, const catalog::DirectoryEntry &dirent) {
-    LogCvmfs(kLogLru, kLogDebug, "insert md5 --> dirent: %s -> '%s'",
-             hash.ToString().c_str(), dirent.name().c_str());
-    const bool result =
-      LruCache<shash::Md5, catalog::DirectoryEntry>::Insert(hash, dirent);
-    return result;
-  }
-
-  bool InsertNegative(const shash::Md5 &hash) {
-    const bool result = Insert(hash, dirent_negative_);
-    if (result)
-      perf::Inc(counters_.n_insert_negative);
-    return result;
-  }
-
-  bool Lookup(const shash::Md5 &hash, catalog::DirectoryEntry *dirent) {
-    const bool result =
-      LruCache<shash::Md5, catalog::DirectoryEntry>::Lookup(hash, dirent);
-    LogCvmfs(kLogLru, kLogDebug, "lookup md5 --> dirent: %s (%s)",
-             hash.ToString().c_str(), result ? "hit" : "miss");
-    return result;
-  }
-
-  bool Forget(const shash::Md5 &hash) {
-    LogCvmfs(kLogLru, kLogDebug, "forget md5: %s",
-             hash.ToString().c_str());
-    return LruCache<shash::Md5, catalog::DirectoryEntry>::Forget(hash);
-  }
-
-  void Drop() {
-    LogCvmfs(kLogLru, kLogDebug, "dropping md5path cache");
-    LruCache<shash::Md5, catalog::DirectoryEntry>::Drop();
-  }
-
- private:
-  catalog::DirectoryEntry dirent_negative_;
-};  // Md5PathCache
 
 }  // namespace lru
 
